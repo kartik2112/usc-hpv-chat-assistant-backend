@@ -1,0 +1,12 @@
+# .env - Environment Variables (NEVER commit this to git!)
+# Add this file to .gitignore
+
+# OpenAI API Key (get from https://platform.openai.com/api-keys)
+OPENAI_API_KEY=sk-your-actual-api-key-here
+
+# Flask environment
+FLASK_ENV=development
+PORT=5000
+
+# Frontend domain (update with your actual frontend URL)
+FRONTEND_URL=http://localhost:3000
