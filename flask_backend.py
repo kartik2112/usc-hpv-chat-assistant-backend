@@ -3,10 +3,11 @@
 # Install: pip install flask flask-cors openai python-dotenv
 
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
+import io
 
 # Load environment variables from .env file
 load_dotenv()
@@ -19,7 +20,7 @@ CORS(app, resources={
         "origins": [
             "http://localhost:3000",  # Local development
             "http://localhost:5000",  # Local development
-            "https://yourdomain.com",  # Replace with your domain
+            "https://kartik2112.github.io",  # Replace with your domain
             "*"  # For testing only - restrict in production
         ],
         "methods": ["POST", "GET", "OPTIONS"],
@@ -30,6 +31,7 @@ CORS(app, resources={
 # Initialize OpenAI client with API key from environment variable
 # NEVER hardcode API keys in code
 openai_api_key = os.getenv("OPENAI_API_KEY")
+TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
 
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set!")
@@ -106,6 +108,72 @@ def chat():
             "error": str(e),
             "success": False
         }), 500
+    
+@app.route('/api/tts', methods=['POST'])
+def text_to_speech():
+    """
+    Text-to-Speech endpoint using OpenAI TTS API
+
+    Request body:
+    {
+        "text": "Text to convert to speech",
+        "language": "en" or "es",
+        "voice": "alloy", "echo", "fable", "onyx", "nova", or "shimmer"
+    }
+
+    Returns:
+        Audio MP3 blob
+    """
+    try:
+        data = request.get_json()
+
+        # Validate required fields
+        if not data or 'text' not in data:
+            return jsonify({'error': 'Missing text in request'}), 400
+
+        text = data.get('text', '').strip()
+        language = data.get('language', 'en')  # 'en' or 'es'
+        voice = data.get('voice', 'echo')  # Default voice
+
+        # Validate text is not empty
+        if not text:
+            return jsonify({'error': 'Text cannot be empty'}), 400
+
+        # Validate voice option (OpenAI supports: alloy, echo, fable, onyx, nova, shimmer)
+        valid_voices = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
+        if voice not in valid_voices:
+            voice = 'echo'  # Default to echo if invalid
+
+        # Map language to appropriate voice if needed
+        if language == 'es':
+            # Use appropriate voice for Spanish
+            voice = voice if voice in valid_voices else 'onyx'
+
+        print(f"Generating TTS: text='{text[:50]}...', language={language}, voice={voice}")
+
+        # Call OpenAI TTS API
+        response = client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=voice,
+            input=text,
+            response_format='mp3'  # Can also be 'opus', 'aac', 'flac'
+        )
+
+        # Convert response to bytes
+        audio_bytes = io.BytesIO(response.content)
+        audio_bytes.seek(0)
+
+        # Return audio file
+        return send_file(
+            audio_bytes,
+            mimetype='audio/mpeg',
+            as_attachment=False,
+            download_name='speech.mp3'
+        )
+
+    except Exception as e:
+        print(f"Error in TTS endpoint: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
