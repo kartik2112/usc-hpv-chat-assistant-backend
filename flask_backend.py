@@ -8,6 +8,11 @@ from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
 import io
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,6 +36,16 @@ CORS(app, resources={
 # Initialize OpenAI client with API key from environment variable
 # NEVER hardcode API keys in code
 openai_api_key = os.getenv("OPENAI_API_KEY")
+
+AUDIO_MODE = 'a2a'  # Change to 'tts' or 'a2a' to switch modes
+
+logger.info(f"🎯 Backend Audio Mode: {AUDIO_MODE.upper()}")
+logger.info(f"   TTS Mode = gpt-3.5-turbo + TTS API")
+logger.info(f"   A2A Mode = gpt-4o-audio-preview")
+
+# Configuration
+OPENAI_TEXT_MODEL = 'gpt-3.5-turbo'
+OPENAI_AUDIO_MODEL = 'gpt-4o-audio-preview'
 TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
 
 if not openai_api_key:
@@ -190,19 +205,153 @@ def text_to_speech():
         error_response.headers['Access-Control-Allow-Origin'] = '*'
         return error_response, 500
 
+# ============================================================================
+# A2A ENDPOINT (only used when AUDIO_MODE == 'a2a')
+# ============================================================================
 
-@app.route("/api/health", methods=["GET"])
-def health_check():
-    """Health check endpoint"""
+@app.route('/api/audio-chat', methods=['POST', 'OPTIONS'])
+def audio_chat():
+    """Audio-to-audio chat endpoint using gpt-4o-audio-preview"""
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data = request.get_json()
+
+        if not data or 'audio' not in data:
+            return jsonify({'error': 'Missing audio data'}), 400
+
+        audio_b64 = data.get('audio')
+        audio_format = data.get('audio_format', 'webm')
+        language = data.get('language', 'en')
+        chat_history = data.get('chat_history', [])
+
+        logger.info(f"[A2A] Received audio (format={audio_format}, lang={language}, history_len={len(chat_history)})")
+
+        # Determine voice based on language
+        voice_option = 'echo' if language == 'en' else 'onyx'
+
+        # Build messages for gpt-4o-audio-preview
+        messages = [{'role': 'system', 'content': SYSTEM_MESSAGE}]
+
+        # Add recent chat history (limit to last 10)
+        if chat_history:
+            messages.extend(chat_history[-10:])
+
+        # Add the audio input message
+        messages.append({
+            'role': 'user',
+            'content': [
+                {
+                    'type': 'input_audio',
+                    'input_audio': {
+                        'data': audio_b64,
+                        'format': audio_format
+                    }
+                }
+            ]
+        })
+
+        logger.info(f"[A2A] Calling gpt-4o-audio-preview with {len(messages)} messages")
+
+        # Call OpenAI gpt-4o-audio-preview API
+        response = client.chat.completions.create(
+            model=OPENAI_AUDIO_MODEL,
+            modalities=['text', 'audio'],
+            audio={
+                'voice': voice_option,
+                'format': 'wav'
+            },
+            messages=messages,
+            max_tokens=800,
+            temperature=0.7
+        )
+
+        # Extract response
+        message = response.choices[0].message
+        text_response = message.content if message.content else "I heard your message."
+
+        # Get audio response
+        audio_response_b64 = None
+        if hasattr(message, 'audio') and message.audio:
+            audio_response_b64 = message.audio.get('data')
+
+        logger.info(f"[A2A] Response generated (text={len(text_response)} chars, has_audio={audio_response_b64 is not None})")
+
+        return jsonify({
+            'text_response': text_response,
+            'audio_response': audio_response_b64,
+            'transcript': message.audio.get('transcript') if hasattr(message, 'audio') else None
+        }), 200
+
+    except Exception as e:
+        logger.error(f"[A2A] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# STATUS ENDPOINT - SHOWS CURRENT MODE AND CAPABILITIES
+# ============================================================================
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check with mode information"""
     return jsonify({
-        "status": "healthy",
-        "service": "HPV Health Assistant Backend"
+        'status': 'ok',
+        'audio_mode': AUDIO_MODE.upper(),
+        'endpoints': {
+            'text_chat': 'ready',
+            'tts': 'ready' if AUDIO_MODE == 'tts' or True else 'available',
+            'audio_chat': 'ready' if AUDIO_MODE == 'a2a' or True else 'available'
+        },
+        'models': {
+            'text': OPENAI_TEXT_MODEL,
+            'audio': OPENAI_AUDIO_MODEL,
+            'tts': TTS_MODEL
+        }
     }), 200
 
-if __name__ == "__main__":
-    # Development mode - use debug=False in production
-    app.run(
-        host="0.0.0.0",  # Listen on all interfaces
-        port=int(os.getenv("PORT", 5000)),
-        debug=os.getenv("FLASK_ENV") == "development"
-    )
+
+@app.route('/mode', methods=['GET'])
+def get_mode():
+    """Get current audio mode"""
+    return jsonify({
+        'current_mode': AUDIO_MODE.upper(),
+        'available_modes': ['tts', 'a2a'],
+        'mode_descriptions': {
+            'tts': 'Text-to-Speech (Browser Speech Rec + TTS API)',
+            'a2a': 'Audio-to-Audio (gpt-4o-audio-preview)'
+        },
+        'instructions': 'To switch modes, update AUDIO_MODE variable and redeploy'
+    }), 200
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+if __name__ == '__main__':
+    print("="*80)
+    print("Starting HPV Chat Assistant Backend (Dual Mode Support)")
+    print("="*80)
+    print(f"\n📊 Audio Mode: {AUDIO_MODE.upper()}")
+
+    if AUDIO_MODE == 'tts':
+        print("   ✓ Using: Browser Speech Recognition + OpenAI TTS")
+        print("   ✓ Endpoint: /api/tts")
+        print("   ✓ Model: gpt-3.5-turbo")
+    else:
+        print("   ✓ Using: OpenAI Audio-to-Audio (gpt-4o-audio-preview)")
+        print("   ✓ Endpoint: /api/audio-chat")
+        print("   ✓ Model: gpt-4o-audio-preview")
+
+    print(f"\nAlways available:")
+    print("   ✓ /api/chat (text chat)")
+    print("   ✓ /api/tts (speech synthesis)")
+    print("   ✓ /api/audio-chat (audio conversation)")
+    print("   ✓ /health (status)")
+    print("   ✓ /mode (mode information)")
+    print("\n" + "="*80)
+
+    app.run(debug=True, host='0.0.0.0', port=5000)
