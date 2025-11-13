@@ -3,7 +3,7 @@
 # Install: pip install flask flask-cors openai python-dotenv
 
 import os
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -109,7 +109,7 @@ def chat():
             "success": False
         }), 500
     
-@app.route('/api/tts', methods=['POST'])
+@app.route('/api/tts', methods=['POST', 'OPTIONS'])
 def text_to_speech():
     """
     Text-to-Speech endpoint using OpenAI TTS API
@@ -122,8 +122,12 @@ def text_to_speech():
     }
 
     Returns:
-        Audio MP3 blob
+        Audio MP3 blob with proper CORS headers
     """
+    # Handle OPTIONS request for CORS preflight
+    if request.method == 'OPTIONS':
+        return '', 204
+
     try:
         data = request.get_json()
 
@@ -139,41 +143,53 @@ def text_to_speech():
         if not text:
             return jsonify({'error': 'Text cannot be empty'}), 400
 
+        # Limit text length to avoid API errors (max 4096 chars)
+        if len(text) > 4096:
+            text = text[:4096]
+
         # Validate voice option (OpenAI supports: alloy, echo, fable, onyx, nova, shimmer)
         valid_voices = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
         if voice not in valid_voices:
-            voice = 'echo'  # Default to echo if invalid
+            voice = 'echo' if language == 'en' else 'onyx'
 
-        # Map language to appropriate voice if needed
-        if language == 'es':
-            # Use appropriate voice for Spanish
-            voice = voice if voice in valid_voices else 'onyx'
-
-        print(f"Generating TTS: text='{text[:50]}...', language={language}, voice={voice}")
+        print(f"[TTS] Generating: text='{text[:50]}...', language={language}, voice={voice}")
 
         # Call OpenAI TTS API
         response = client.audio.speech.create(
             model=TTS_MODEL,
             voice=voice,
             input=text,
-            response_format='mp3'  # Can also be 'opus', 'aac', 'flac'
+            response_format='mp3'
         )
 
-        # Convert response to bytes
+        # Get audio bytes
         audio_bytes = io.BytesIO(response.content)
         audio_bytes.seek(0)
 
-        # Return audio file
-        return send_file(
+        print(f"[TTS] Successfully generated audio ({len(response.content)} bytes)")
+
+        # Create response with proper headers
+        response_obj = make_response(send_file(
             audio_bytes,
             mimetype='audio/mpeg',
             as_attachment=False,
             download_name='speech.mp3'
-        )
+        ))
+
+        # Ensure CORS headers are set
+        response_obj.headers['Access-Control-Allow-Origin'] = '*'
+        response_obj.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response_obj.headers['Content-Type'] = 'audio/mpeg'
+        response_obj.headers['Cache-Control'] = 'no-cache'
+
+        return response_obj
 
     except Exception as e:
-        print(f"Error in TTS endpoint: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+        print(f"[TTS] Error: {str(e)}")
+        error_response = jsonify({'error': str(e)})
+        error_response.headers['Access-Control-Allow-Origin'] = '*'
+        return error_response, 500
+
 
 @app.route("/api/health", methods=["GET"])
 def health_check():
