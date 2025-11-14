@@ -76,6 +76,16 @@ def chat():
         "max_tokens": 800,
         "temperature": 0.7
     }
+
+    Expected JSON payload:
+    {
+        "messages": [
+            {"role": "system", "content": "You are..."},
+            {"role": "user", "content": "Hello"}
+        ],
+        "model": "gpt-5-mini",
+        "max_tokens": 800
+    }
     """
     
     # Handle CORS preflight
@@ -95,14 +105,14 @@ def chat():
         messages = data.get("messages", [])
         model = data.get("model", "gpt-5-mini")
         max_tokens = data.get("max_tokens", 800)
-        temperature = data.get("temperature", 0.7)
+        # temperature = data.get("temperature", 0.7)
         
         # Call OpenAI API (API key is securely stored on backend)
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             max_completion_tokens=max_tokens,
-            temperature=temperature
+            # temperature=temperature
         )
         
         # Extract response content
