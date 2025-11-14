@@ -162,7 +162,8 @@ def text_to_speech():
 
         text = data.get('text', '').strip()
         language = data.get('language', 'en')  # 'en' or 'es'
-        voice = data.get('voice', 'echo')  # Default voice
+        voice = data.get('voice', 'nova')  # Default voice
+        speed = data.get('speed', 0.7)  # Default speed
 
         # Validate text is not empty
         if not text:
@@ -184,7 +185,8 @@ def text_to_speech():
             model=TTS_MODEL,
             voice=voice,
             input=text,
-            response_format='mp3'
+            response_format='mp3',
+            speed=speed
         )
 
         # Get audio bytes
