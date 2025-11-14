@@ -93,7 +93,7 @@ def chat():
             }), 400
         
         messages = data.get("messages", [])
-        model = data.get("model", "gpt-3.5-turbo")
+        model = data.get("model", "gpt-5-mini")
         max_tokens = data.get("max_tokens", 800)
         temperature = data.get("temperature", 0.7)
         
@@ -101,7 +101,7 @@ def chat():
         response = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=max_tokens,
+            max_completion_tokens=max_tokens,
             temperature=temperature
         )
         
