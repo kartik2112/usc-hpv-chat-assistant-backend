@@ -307,7 +307,7 @@ def audio_chat():
 # STATUS ENDPOINT - SHOWS CURRENT MODE AND CAPABILITIES
 # ============================================================================
 
-@app.route('/health', methods=['GET'])
+@app.route('/api/health', methods=['GET'])
 def health():
     """Health check with mode information"""
     return jsonify({
@@ -326,7 +326,7 @@ def health():
     }), 200
 
 
-@app.route('/mode', methods=['GET'])
+@app.route('/api/mode', methods=['GET'])
 def get_mode():
     """Get current audio mode"""
     return jsonify({
