@@ -4,3 +4,9 @@ openai
 python-dotenv
 gunicorn
 requests
+langchain
+langchain-openai
+beautifulsoup4
+langchain-chroma
+langchain_text_splitters
+langchain-community

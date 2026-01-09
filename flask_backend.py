@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 import io
 import logging
 
+from rag_pipeline import ask_rag_question, build_rag_agent
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -37,21 +39,23 @@ CORS(app, resources={
 # NEVER hardcode API keys in code
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
+# Configuration
+OPENAI_TEXT_MODEL = "gpt-5-mini"
+MAX_COMPLETION_TOKENS = 1200
+OPENAI_AUDIO_MODEL = 'gpt-4o-audio-preview'
+TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
 AUDIO_MODE = 'a2a'  # Change to 'tts' or 'a2a' to switch modes
 
 logger.info(f"🎯 Backend Audio Mode: {AUDIO_MODE.upper()}")
-logger.info(f"   TTS Mode = gpt-3.5-turbo + TTS API")
+logger.info(f"   TTS Mode = {OPENAI_TEXT_MODEL} + TTS API")
 logger.info(f"   A2A Mode = gpt-4o-audio-preview")
 
-# Configuration
-OPENAI_TEXT_MODEL = 'gpt-3.5-turbo'
-OPENAI_AUDIO_MODEL = 'gpt-4o-audio-preview'
-TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
 
 if not openai_api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set!")
 
 client = OpenAI(api_key=openai_api_key)
+rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
 @app.route("/", methods=["GET"])
 def home():
@@ -103,29 +107,36 @@ def chat():
             }), 400
         
         messages = data.get("messages", [])
-        model = data.get("model", "gpt-5-mini")
-        max_tokens = data.get("max_tokens", 800)
         # temperature = data.get("temperature", 0.7)
         
         # Call OpenAI API (API key is securely stored on backend)
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            max_completion_tokens=max_tokens,
-            # temperature=temperature
-        )
+        # response = client.chat.completions.create(
+        #     model=OPENAI_TEXT_MODEL,
+        #     messages=messages,
+        #     max_completion_tokens=MAX_COMPLETION_TOKENS,
+        #     # temperature=temperature
+        # )
         
-        # Extract response content
-        assistant_message = response.choices[0].message.content
-        
+        # # Extract response content
+        # assistant_message = response.choices[0].message.content
+
+        response = ask_rag_question(rag_agent,messages)
+        assistant_message = response.content
+
         return jsonify({
             "success": True,
             "message": assistant_message,
+            # "usage": {
+            #     "prompt_tokens": response.usage.prompt_tokens,
+            #     "completion_tokens": response.usage.completion_tokens,
+            #     "total_tokens": response.usage.total_tokens
+            # }
             "usage": {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens
-            }
+                "prompt_tokens": response.response_metadata['token_usage']['prompt_tokens'],
+                "completion_tokens": response.response_metadata['token_usage']['completion_tokens'],
+                "total_tokens": response.response_metadata['token_usage']['total_tokens']
+            },
+            "rag_used": True
         }), 200
         
     except Exception as e:
