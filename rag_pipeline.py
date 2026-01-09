@@ -31,13 +31,13 @@ from langchain_community.document_loaders import WebBaseLoader
 chroma_setting = Settings(anonymized_telemetry=False)
 
 
-# Set Windows event loop policy
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# # Set Windows event loop policy
+# if sys.platform == "win32":
+#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-# Apply nest_asyncio to allow nested event loops
-import nest_asyncio  # Import nest_asyncio module for asynchronous operations
-nest_asyncio.apply()  # Apply nest_asyncio to resolve any issues with asyncio event loop
+# # Apply nest_asyncio to allow nested event loops
+# import nest_asyncio  # Import nest_asyncio module for asynchronous operations
+# nest_asyncio.apply()  # Apply nest_asyncio to resolve any issues with asyncio event loop
 
 
 class HPVRAGPipeline:
