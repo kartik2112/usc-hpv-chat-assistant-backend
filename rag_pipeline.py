@@ -105,8 +105,8 @@ class HPVRAGPipeline:
 		# 	return_source_documents=True
 		# )
 
-	def get_string_hash(self, text):
-		return hashlib.sha256(text.encode('utf-8')).hexdigest()
+	def get_string_hash(self, docs):
+		return hashlib.sha256("\n".join([doc.page_content for doc in docs]).encode('utf-8')).hexdigest()
 
 	def fetch_current_chromadb_entries(self):
 		entities = self.vector_store.get(include=["metadatas"])
@@ -135,11 +135,16 @@ class HPVRAGPipeline:
 			loader = WebBaseLoader(
 				web_paths=(url, ),
 				bs_kwargs={"parse_only": bs4_strainer},
+				requests_kwargs={
+					'headers': {
+						'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+					}
+				}
 			)
 			docs = loader.load()
 
-			assert len(docs) == 1
 			print(f"Total characters: {len(docs[0].page_content)}")
+			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
 			if len(docs[0].page_content) == 0:
 				raise ValueError("Not a webpage")
 			return docs
@@ -166,17 +171,18 @@ class HPVRAGPipeline:
 				
 				print(f"Loaded {len(docs)} documents from {url}")
 				print(f"Total characters: {sum(len(doc.page_content) for doc in docs)}")
+				print(f"First few characters of the content: {docs[0].page_content[:100]}")
 				return docs
 			except Exception as e:
 				print(f"Error loading PDF: {str(e)}")
 		return loader
 
 	def _alt_crawl_webpage_and_add_to_rag(self, url):
-		
+		print(f"Crawling webpage: {url}")
 		docs = self._crawl_url(url)
 
 		all_splits = self.text_splitter.split_documents(docs)
-		fulltext_hash = self.get_string_hash(docs[0].page_content)
+		fulltext_hash = self.get_string_hash(docs)
 
 		if (url, fulltext_hash) in self.existing_urls:
 			print(f"URL {url} with hash {fulltext_hash} already exists.")
