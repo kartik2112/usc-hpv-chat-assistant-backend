@@ -25,7 +25,7 @@ from collections import defaultdict
 
 
 chroma_setting = Settings(anonymized_telemetry=False)
-USE_CHROMA_CLOUD = True
+USE_CHROMA_CLOUD = False
 
 
 class HPVRAGPipeline:
@@ -64,9 +64,9 @@ class HPVRAGPipeline:
 		self.existing_urls = set()
 		self.existing_urls_to_chroma_ids = defaultdict(list)
 		self.urls = [
-			# "https://www.acog.org/womens-health/faqs/hpv-vaccination",
-			# "https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer",
-			# "https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html",
+			"https://www.acog.org/womens-health/faqs/hpv-vaccination",
+			"https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer",
+			"https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html",
 			"https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf",
 			"https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf",
 			"https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv",
@@ -175,6 +175,8 @@ class HPVRAGPipeline:
 			if USE_CHROMA_CLOUD and len(self.existing_urls_to_chroma_ids[url]) > 0:
 				self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
 			print(f"Adding new content from URL {url}")
+			# if not(USE_CHROMA_CLOUD):
+			# 	print(docs)
 			# Compute hashes for all splits
 			for split in all_splits:
 				split.metadata['fulltext_hash'] = fulltext_hash
