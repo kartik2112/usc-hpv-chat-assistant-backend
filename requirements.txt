@@ -12,3 +12,4 @@ langchain_text_splitters
 langchain-community
 unstructured
 pypdf
+Flask-APScheduler

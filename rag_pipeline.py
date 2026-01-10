@@ -144,9 +144,9 @@ class HPVRAGPipeline:
 			docs = loader.load()
 
 			print(f"Total characters: {len(docs[0].page_content)}")
-			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
 			if len(docs[0].page_content) == 0:
 				raise ValueError("Not a webpage")
+			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
 			return docs
 		except Exception as e:
 			try:

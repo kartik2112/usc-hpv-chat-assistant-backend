@@ -9,6 +9,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import io
 import logging
+from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
 
@@ -19,7 +20,11 @@ logger = logging.getLogger(__name__)
 # Load environment variables from .env file
 load_dotenv()
 
+class Config(object):
+    SCHEDULER_API_ENABLED = True
 app = Flask(__name__)
+app.config.from_object(Config())
+scheduler = APScheduler()
 
 # CORS Configuration - Allow requests from your frontend
 CORS(app, resources={
@@ -56,6 +61,12 @@ if not openai_api_key:
 
 client = OpenAI(api_key=openai_api_key)
 rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
+
+
+def daily_task():
+    """Your daily logic goes here (e.g., making an API call, cleaning up data)"""
+    print("Daily RAG Refresh task is running...")
+    rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
 @app.route("/", methods=["GET"])
 def home():
@@ -377,4 +388,11 @@ if __name__ == '__main__':
     print("   ✓ /mode (mode information)")
     print("\n" + "="*80)
 
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    # app.run(debug=True, host='0.0.0.0', port=5000)
+    scheduler.init_app(app)
+    # Schedule the job to run every day at 1:00 AM
+    scheduler.add_job(id='daily_task_1am', func=daily_task, trigger='cron', hour=1, minute=0)
+    scheduler.start()
+
+    # When running with app.run(), set use_reloader=False to prevent jobs from running twice
+    app.run(use_reloader=False) 
