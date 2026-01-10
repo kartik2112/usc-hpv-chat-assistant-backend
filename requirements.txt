@@ -10,3 +10,5 @@ beautifulsoup4
 langchain-chroma
 langchain_text_splitters
 langchain-community
+unstructured
+pypdf

@@ -1,43 +1,31 @@
 # Reference: https://nayakpplaban.medium.com/building-a-smart-web-rag-assistant-a-step-by-step-guide-ff5436a1349f
 # https://docs.langchain.com/oss/python/langchain/rag
+# https://docs.langchain.com/oss/python/integrations/vectorstores/chroma#other-search-methods
+# https://stackoverflow.com/questions/76870837/how-to-delete-documents-in-langchain-vectorstore
 
 import os
 from functools import partial
+import shutil
+import tempfile
 from typing import Set
 import hashlib
 
 import requests
-from bs4 import BeautifulSoup, SoupStrainer
+from bs4 import SoupStrainer
 
 from chromadb.config import Settings
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_community.document_loaders import TextLoader, OnlinePDFLoader, WebBaseLoader
+from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.agents.middleware import dynamic_prompt, ModelRequest
 from langchain.agents import create_agent
 from collections import defaultdict
 
-# Optional / commented integrations (kept for reference)
-# from dotenv import load_dotenv
-# from langchain_groq import ChatGroq
-# from langchain_community.vectorstores import Chroma as CommunityChroma
-# from langchain.chains import ConversationalRetrievalChain
-# from scrapegraphai.graphs import SmartScraperGraph
-# from crawl4ai import AsyncWebCrawler, CacheMode, CrawlerRunConfig
 
 
 chroma_setting = Settings(anonymized_telemetry=False)
-
-
-# # Set Windows event loop policy
-# if sys.platform == "win32":
-#     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# # Apply nest_asyncio to allow nested event loops
-# import nest_asyncio  # Import nest_asyncio module for asynchronous operations
-# nest_asyncio.apply()  # Apply nest_asyncio to resolve any issues with asyncio event loop
+USE_CHROMA_CLOUD = True
 
 
 class HPVRAGPipeline:
@@ -51,9 +39,9 @@ class HPVRAGPipeline:
 		self.response_llm = ChatOpenAI(model_name=openai_text_model, max_completion_tokens=max_completion_tokens)
 
 
-		self.CHROMA_CLOUD = True
+		
 		# Initialize Vector Store
-		if self.CHROMA_CLOUD:
+		if USE_CHROMA_CLOUD:
 			self.vector_store =  Chroma(
 				collection_name="hpv_facts_rag",
 				embedding_function=self.embeddings,
@@ -76,13 +64,19 @@ class HPVRAGPipeline:
 		self.existing_urls = set()
 		self.existing_urls_to_chroma_ids = defaultdict(list)
 		self.urls = [
-			"https://www.acog.org/womens-health/faqs/hpv-vaccination",
-			"https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer",
-			"https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html",
-			# "https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf",
-			# "https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf",
-			# "https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv",
+			# "https://www.acog.org/womens-health/faqs/hpv-vaccination",
+			# "https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer",
+			# "https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html",
+			"https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf",
+			"https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf",
+			"https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv",
 		]
+
+		self.text_splitter = RecursiveCharacterTextSplitter(
+			chunk_size=1000,  # chunk size (characters)
+			chunk_overlap=200,  # chunk overlap (characters)
+			add_start_index=True,  # track index in original document
+		)
 
 		# self.qa_chain = None
 		self.agent = None
@@ -96,7 +90,8 @@ class HPVRAGPipeline:
 		"""Set up the RAG database"""
 		# for url in self.urls:
 		# 	self._crawl_webpage_and_add_to_rag(url=url)
-		self.fetch_current_chromadb_entries()
+		if USE_CHROMA_CLOUD:
+			self.fetch_current_chromadb_entries()
 		for url in self.urls:
 			self._alt_crawl_webpage_and_add_to_rag(url=url)
 
@@ -135,11 +130,33 @@ class HPVRAGPipeline:
 
 			assert len(docs) == 1
 			print(f"Total characters: {len(docs[0].page_content)}")
+			if len(docs[0].page_content) == 0:
+				raise ValueError("Not a webpage")
 			return docs
 		except Exception as e:
 			try:
-				loader = OnlinePDFLoader(url)
-				return loader
+				print(f"Trying to read {url} using OnlinePDFLoader")
+				# loader = OnlinePDFLoader(url)
+				temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False)
+				temp_file_path = temp_file.name
+				try:
+					with requests.get(url, stream=True) as r:
+						r.raise_for_status()
+						shutil.copyfileobj(r.raw, temp_file)
+					print(f"Successfully downloaded file to: {temp_file_path}")
+					loader = PyPDFLoader(temp_file_path)
+					docs = loader.load()
+				except requests.exceptions.RequestException as e:
+					print(f"An error occurred during download: {e}")
+					if os.path.exists(temp_file_path):
+						os.remove(temp_file_path)
+					return None
+				finally:
+					temp_file.close()
+				
+				print(f"Loaded {len(docs)} documents from {url}")
+				print(f"Total characters: {sum(len(doc.page_content) for doc in docs)}")
+				return docs
 			except Exception as e:
 				print(f"Error loading PDF: {str(e)}")
 		return loader
@@ -148,19 +165,15 @@ class HPVRAGPipeline:
 		
 		docs = self._crawl_url(url)
 
-		text_splitter = RecursiveCharacterTextSplitter(
-			chunk_size=1000,  # chunk size (characters)
-			chunk_overlap=200,  # chunk overlap (characters)
-			add_start_index=True,  # track index in original document
-		)
-		all_splits = text_splitter.split_documents(docs)
+		all_splits = self.text_splitter.split_documents(docs)
 		fulltext_hash = self.get_string_hash(docs[0].page_content)
 
 		if (url, fulltext_hash) in self.existing_urls:
 			print(f"URL {url} with hash {fulltext_hash} already exists.")
 			return
 		else:
-			self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
+			if USE_CHROMA_CLOUD and len(self.existing_urls_to_chroma_ids[url]) > 0:
+				self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
 			print(f"Adding new content from URL {url}")
 			# Compute hashes for all splits
 			for split in all_splits:
