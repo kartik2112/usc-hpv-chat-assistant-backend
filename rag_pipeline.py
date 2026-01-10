@@ -25,7 +25,7 @@ from collections import defaultdict
 
 
 chroma_setting = Settings(anonymized_telemetry=False)
-USE_CHROMA_CLOUD = False
+USE_CHROMA_CLOUD = True
 
 
 class HPVRAGPipeline:
@@ -94,6 +94,8 @@ class HPVRAGPipeline:
 			self.fetch_current_chromadb_entries()
 		for url in self.urls:
 			self._alt_crawl_webpage_and_add_to_rag(url=url)
+		if USE_CHROMA_CLOUD:
+			self.clean_up_extra_urls()
 
 		# Create QA chain
 		# self.qa_chain = ConversationalRetrievalChain.from_llm(
@@ -116,6 +118,14 @@ class HPVRAGPipeline:
 		if len(self.existing_urls) > 0:
 			print(f"Found existing URLs in Chroma Cloud:")
 			print(self.existing_urls)
+
+	def clean_up_extra_urls(self):
+		"""Remove URLs from Chroma DB that are no longer present in the existing URLs set."""
+		if USE_CHROMA_CLOUD:
+			for url in self.existing_urls_to_chroma_ids.keys():
+				if url not in self.urls:
+					self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
+					print(f"Removed URL {url} from Chroma Cloud.")
 
 	def _crawl_url(self, url):
 		try:
