@@ -31,7 +31,6 @@ USE_CHROMA_CLOUD = True
 class HPVRAGPipeline:
 	def __init__(self, openai_text_model='gpt-5-mini', persist_directory="chroma_db", max_completion_tokens=1200):
 		self.persist_directory = persist_directory
-		self.collection_metadata = {"hnsw:space": "cosine"}
 
 		self.openai_text_model = openai_text_model
 
@@ -70,6 +69,9 @@ class HPVRAGPipeline:
 			"https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf",
 			"https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf",
 			"https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv",
+			"https://pubmed.ncbi.nlm.nih.gov/39982254/",
+			"https://asccp.org/wp-content/uploads/2025/11/ASCCP-Practice-Advisory-Self-Collection-for-Cervical-Cancer-Screening-final-updated-10-2-25.pdf",
+			"https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590",
 		]
 
 		self.text_splitter = RecursiveCharacterTextSplitter(
