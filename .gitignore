@@ -2,3 +2,4 @@ env_template.txt
 test_rag_pipeline.ipynb
 chroma_db
 *__pycache__*
+.DS_Store
