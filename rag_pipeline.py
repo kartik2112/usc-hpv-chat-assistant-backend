@@ -183,6 +183,8 @@ class HPVRAGPipeline:
 		print(f"Crawling webpage: {url}")
 		docs = self._crawl_url(url)
 
+		if docs is None:
+			return
 		all_splits = self.text_splitter.split_documents(docs)
 		fulltext_hash = self.get_string_hash(docs)
 
