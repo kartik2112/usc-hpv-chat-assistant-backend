@@ -8,7 +8,9 @@ from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
 import io
+import re
 import logging
+import scrubadub
 from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
@@ -68,6 +70,34 @@ def daily_task():
     print("Daily RAG Refresh task is running...")
     rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
+def detect_phi_backend(text):
+    """Detect PHI/PII in text using scrubadub + custom regex patterns. Runs fully locally."""
+    detections = set()
+
+    # scrubadub detection (emails, names, SSNs, phone numbers, credit cards)
+    scrubber = scrubadub.Scrubber()
+    for filth in scrubber.iter_filth(text):
+        detections.add(filth.type)
+
+    # Medical Record Numbers (MRN: 12345678)
+    if re.search(r'\b(?:MRN|mrn|MR#|mr#)[\s:]*\d{4,12}\b', text):
+        detections.add('medical_record_number')
+
+    # Street addresses (123 Main Street)
+    if re.search(
+        r'\b\d{1,5}\s+(?:[A-Za-z]+\s){1,3}'
+        r'(?:St|Street|Ave|Avenue|Blvd|Boulevard|Dr|Drive|Rd|Road|Ln|Lane|Way|Ct|Court|Pl|Place)\.?\b',
+        text, re.IGNORECASE
+    ):
+        detections.add('address')
+
+    # Date of birth patterns (MM/DD/YYYY, MM-DD-YYYY)
+    if re.search(r'\b(?:0?[1-9]|1[0-2])[/\-.](?:0?[1-9]|[12]\d|3[01])[/\-.](?:19|20)\d{2}\b', text):
+        detections.add('date_of_birth')
+
+    return list(detections)
+
+
 @app.route("/", methods=["GET"])
 def home():
     """Health check endpoint"""
@@ -119,7 +149,21 @@ def chat():
         
         messages = data.get("messages", [])
         # temperature = data.get("temperature", 0.7)
-        
+
+        # Detect PHI/PII in the latest user message (local only, no external calls)
+        phi_warning = False
+        phi_types = []
+        if messages:
+            last_user_msg = next(
+                (m['content'] for m in reversed(messages) if m.get('role') == 'user'),
+                None
+            )
+            if last_user_msg:
+                phi_types = detect_phi_backend(last_user_msg)
+                if phi_types:
+                    phi_warning = True
+                    logger.warning(f"PHI detected in user message: {phi_types}")
+
         # Call OpenAI API (API key is securely stored on backend)
         # response = client.chat.completions.create(
         #     model=OPENAI_TEXT_MODEL,
@@ -130,6 +174,23 @@ def chat():
         
         # # Extract response content
         # assistant_message = response.choices[0].message.content
+
+        # If PHI detected, block the RAG call and return a warning message instead
+        if phi_warning:
+            return jsonify({
+                "success": True,
+                "message": "It looks like your message may contain personal information. "
+                           "For your privacy, please remove any personal details (such as names, "
+                           "phone numbers, addresses, or dates of birth) and try again.",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0
+                },
+                "rag_used": False,
+                "phi_warning": phi_warning,
+                "phi_types": phi_types
+            }), 200
 
         response = ask_rag_question(rag_agent,messages)
         assistant_message = response.content
@@ -147,7 +208,9 @@ def chat():
                 "completion_tokens": response.response_metadata['token_usage']['completion_tokens'],
                 "total_tokens": response.response_metadata['token_usage']['total_tokens']
             },
-            "rag_used": True
+            "rag_used": True,
+            "phi_warning": False,
+            "phi_types": []
         }), 200
         
     except Exception as e:

@@ -13,3 +13,4 @@ langchain-community
 unstructured
 pypdf
 Flask-APScheduler
+scrubadub
