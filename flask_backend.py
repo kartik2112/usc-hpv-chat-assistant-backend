@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import io
 import re
 import logging
-from pii_codex.services.analysis_service import PIIAnalysisService
+from presidio_analyzer import AnalyzerEngine
 from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
@@ -70,17 +70,16 @@ def daily_task():
     print("Daily RAG Refresh task is running...")
     rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
-pii_analysis_service = PIIAnalysisService()
+pii_analysis_service = AnalyzerEngine()
 
 def detect_phi_backend(text):
-    """Detect PHI/PII in text using pii-codex (Presidio + spaCy). Runs fully locally."""
+    """Detect PHI/PII in text using Presidio + spaCy. Runs fully locally."""
     detections = set()
 
-    # pii-codex detection (emails, names, SSNs, phone numbers, credit cards, addresses, dates, etc.)
-    result = pii_analysis_service.analyze_item(text)
-    for detection in result.detections:
-        if detection.entity_type:
-            detections.add(detection.entity_type)
+    # Presidio detection (emails, names, SSNs, phone numbers, credit cards, addresses, dates, etc.)
+    results = pii_analysis_service.analyze(text=text, language="en")
+    for result in results:
+        detections.add(result.entity_type)
 
     # Medical Record Numbers (MRN: 12345678) - custom pattern not covered by Presidio
     if re.search(r'\b(?:MRN|mrn|MR#|mr#)[\s:]*\d{4,12}\b', text):

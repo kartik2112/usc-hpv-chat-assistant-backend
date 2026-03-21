@@ -10,7 +10,7 @@ dependencies = [
     "python-dotenv",
     "gunicorn",
     "requests",
-    "langchain",
+    "langchain>=1.0.0",
     "langchain-openai",
     "beautifulsoup4",
     "langchain-chroma",
@@ -19,7 +19,8 @@ dependencies = [
     "spacy",
     "pypdf",
     "Flask-APScheduler",
-    "pii-codex[detections]",
+    "presidio-analyzer",
+    "presidio-anonymizer",
 ]
 
 [tool.setuptools]
