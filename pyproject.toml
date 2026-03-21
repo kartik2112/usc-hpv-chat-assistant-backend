@@ -21,3 +21,6 @@ dependencies = [
     "Flask-APScheduler",
     "pii-codex[detections]",
 ]
+
+[tool.setuptools]
+py-modules = ["flask_backend", "rag_pipeline"]
