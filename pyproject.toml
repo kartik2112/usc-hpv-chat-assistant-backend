@@ -1,0 +1,23 @@
+[project]
+name = "usc-hpv-chat-assistant-backend"
+version = "1.0.0"
+description = "HPV Chat Assistant Backend"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "Flask",
+    "Flask-CORS",
+    "openai",
+    "python-dotenv",
+    "gunicorn",
+    "requests",
+    "langchain",
+    "langchain-openai",
+    "beautifulsoup4",
+    "langchain-chroma",
+    "langchain-text-splitters",
+    "langchain-community",
+    "spacy",
+    "pypdf",
+    "Flask-APScheduler",
+    "pii-codex[detections]",
+]
