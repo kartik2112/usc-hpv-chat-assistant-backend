@@ -5,8 +5,8 @@ set -o errexit
 curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.local/bin:$PATH"
 
-# Create venv and install dependencies
-uv venv /opt/render/project/src/.venv
+# Create venv (--clear in case it already exists from cache)
+uv venv /opt/render/project/src/.venv --clear
 export PATH="/opt/render/project/src/.venv/bin:$PATH"
 
 uv pip install -r requirements.txt
