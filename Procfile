@@ -1,1 +1,1 @@
-web: gunicorn flask_backend:app
+web: /opt/render/project/src/.venv/bin/gunicorn flask_backend:app
