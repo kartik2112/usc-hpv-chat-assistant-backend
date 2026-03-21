@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 import io
 import re
 import logging
-import scrubadub
+from pii_codex.services.analysis_service import PIIAnalysisService
 from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
@@ -70,30 +70,21 @@ def daily_task():
     print("Daily RAG Refresh task is running...")
     rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
+pii_analysis_service = PIIAnalysisService()
+
 def detect_phi_backend(text):
-    """Detect PHI/PII in text using scrubadub + custom regex patterns. Runs fully locally."""
+    """Detect PHI/PII in text using pii-codex (Presidio + spaCy). Runs fully locally."""
     detections = set()
 
-    # scrubadub detection (emails, names, SSNs, phone numbers, credit cards)
-    scrubber = scrubadub.Scrubber()
-    for filth in scrubber.iter_filth(text):
-        detections.add(filth.type)
+    # pii-codex detection (emails, names, SSNs, phone numbers, credit cards, addresses, dates, etc.)
+    result = pii_analysis_service.analyze_item(text)
+    for detection in result.detections:
+        if detection.entity_type:
+            detections.add(detection.entity_type)
 
-    # Medical Record Numbers (MRN: 12345678)
+    # Medical Record Numbers (MRN: 12345678) - custom pattern not covered by Presidio
     if re.search(r'\b(?:MRN|mrn|MR#|mr#)[\s:]*\d{4,12}\b', text):
-        detections.add('medical_record_number')
-
-    # Street addresses (123 Main Street)
-    if re.search(
-        r'\b\d{1,5}\s+(?:[A-Za-z]+\s){1,3}'
-        r'(?:St|Street|Ave|Avenue|Blvd|Boulevard|Dr|Drive|Rd|Road|Ln|Lane|Way|Ct|Court|Pl|Place)\.?\b',
-        text, re.IGNORECASE
-    ):
-        detections.add('address')
-
-    # Date of birth patterns (MM/DD/YYYY, MM-DD-YYYY)
-    if re.search(r'\b(?:0?[1-9]|1[0-2])[/\-.](?:0?[1-9]|[12]\d|3[01])[/\-.](?:19|20)\d{2}\b', text):
-        detections.add('date_of_birth')
+        detections.add('MEDICAL_RECORD_NUMBER')
 
     return list(detections)
 
