@@ -157,9 +157,9 @@ class HPVRAGPipeline:
 				temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False)
 				temp_file_path = temp_file.name
 				try:
-					with requests.get(url, stream=True) as r:
+					with requests.get(url) as r:
 						r.raise_for_status()
-						shutil.copyfileobj(r.raw, temp_file)
+						temp_file.write(r.content)
 					print(f"Successfully downloaded file to: {temp_file_path}")
 					loader = PyPDFLoader(temp_file_path)
 					docs = loader.load()
@@ -177,7 +177,7 @@ class HPVRAGPipeline:
 				return docs
 			except Exception as e:
 				print(f"Error loading PDF: {str(e)}")
-		return loader
+		return None
 
 	def _alt_crawl_webpage_and_add_to_rag(self, url):
 		print(f"Crawling webpage: {url}")
