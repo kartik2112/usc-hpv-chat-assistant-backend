@@ -11,6 +11,7 @@ import io
 import re
 import logging
 from presidio_analyzer import AnalyzerEngine
+from presidio_analyzer.nlp_engine import NlpEngineProvider
 from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
@@ -70,7 +71,11 @@ def daily_task():
     print("Daily RAG Refresh task is running...")
     rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
-pii_analysis_service = AnalyzerEngine()
+_nlp_engine = NlpEngineProvider(nlp_configuration={
+    "nlp_engine_name": "spacy",
+    "models": [{"lang_code": "en", "model_name": "en_core_web_md"}],
+}).create_engine()
+pii_analysis_service = AnalyzerEngine(nlp_engine=_nlp_engine)
 
 def detect_phi_backend(text):
     """Detect PHI/PII in text using Presidio + spaCy. Runs fully locally."""
