@@ -94,6 +94,40 @@ def ensure_cors_headers(response):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
 
+# ---------------------------------------------------------------------------
+# Server-side domain allowlist  (independent of CORS)
+#
+# CORS is a *browser* mechanism — the browser decides whether JS can read a
+# response based on the Access-Control-Allow-Origin header.  It does NOT
+# prevent the server from receiving and processing the request.
+#
+# This before_request hook adds a real server-side gate: if the Origin header
+# sent by the browser is not in ALLOWED_ORIGINS, Flask returns 403 before any
+# business logic runs.  The 403 still carries Access-Control-Allow-Origin: *
+# (added by ensure_cors_headers above) so the browser CAN read the error
+# body — the request is blocked by our code, not by the browser's CORS check.
+#
+# Requests without an Origin header (curl, Postman, server-to-server) are
+# allowed through unconditionally, because only browsers attach Origin.
+# If you also want to block non-browser callers, check Referer or add an
+# API-key header instead.
+# ---------------------------------------------------------------------------
+ALLOWED_ORIGINS = {
+    "https://kartik2112.github.io",
+    "https://dipsurvey-ann.isi.edu",
+    "https://sackend.isi.edu",
+}
+
+@app.before_request
+def restrict_to_allowed_origins():
+    origin = request.headers.get("Origin", "")
+    # No Origin header → non-browser client (curl, Postman, etc.) → allow through
+    if not origin:
+        return
+    if origin not in ALLOWED_ORIGINS:
+        logger.warning(f"Rejected request from disallowed origin: {origin}")
+        return jsonify({"error": "Origin not allowed"}), 403
+
 # Initialize OpenAI client with API key from environment variable
 # NEVER hardcode API keys in code
 openai_api_key = os.getenv("OPENAI_API_KEY")
