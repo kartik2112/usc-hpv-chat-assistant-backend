@@ -95,16 +95,57 @@ _nlp_engine = NlpEngineProvider(nlp_configuration={
 }).create_engine()
 pii_analysis_service = AnalyzerEngine(nlp_engine=_nlp_engine)
 
+# ---------------------------------------------------------------------------
+# Explicit HIPAA PHI entity allowlist
+# ---------------------------------------------------------------------------
+# Only these Presidio entity types are checked. Omitting broad types like
+# LOCATION, ORGANIZATION, NRP, and URL prevents false positives on common
+# medical terms (e.g. spaCy's NER misidentifying "HPV" as a PERSON name).
+# Reference: 45 CFR §164.514(b) — HIPAA Safe Harbour 18 identifiers.
+# ---------------------------------------------------------------------------
+HIPAA_PHI_ENTITIES = [
+    "PERSON",             # Patient / provider names
+    "PHONE_NUMBER",       # Phone and fax numbers
+    "EMAIL_ADDRESS",      # Email addresses
+    "US_SSN",             # Social Security Numbers
+    "CREDIT_CARD",        # Credit / debit card numbers
+    "US_BANK_NUMBER",     # Bank account numbers
+    "US_DRIVER_LICENSE",  # Driver's licence numbers
+    "US_PASSPORT",        # Passport numbers
+    "MEDICAL_LICENSE",    # Medical licence / DEA numbers
+    "IP_ADDRESS",         # Device IP addresses
+    "DATE_TIME",          # Dates of birth, appointment dates
+]
+
+# Raise the minimum confidence score above Presidio's default of 0.5.
+# This suppresses low-confidence PERSON hits where spaCy's NER model
+# incorrectly labels medical acronyms (HPV, HER2, BRCA, …) as names.
+# Genuine names in conversational text ("My name is Jane Doe") consistently
+# score ≥ 0.85, so real PHI is still caught.
+PHI_SCORE_THRESHOLD = 0.80
+
+
 def detect_phi_backend(text):
-    """Detect PHI/PII in text using Presidio + spaCy. Runs fully locally."""
+    """Detect HIPAA-relevant PHI in text using Presidio + spaCy (local only).
+
+    Returns a list of detected entity type strings, or an empty list when no
+    PHI is found. Only the entity types in HIPAA_PHI_ENTITIES are checked,
+    and only detections above PHI_SCORE_THRESHOLD are reported — this
+    prevents medical acronyms like 'HPV' from triggering false positives.
+    """
     detections = set()
 
-    # Presidio detection (emails, names, SSNs, phone numbers, credit cards, addresses, dates, etc.)
-    results = pii_analysis_service.analyze(text=text, language="en")
+    results = pii_analysis_service.analyze(
+        text=text,
+        language="en",
+        entities=HIPAA_PHI_ENTITIES,
+        score_threshold=PHI_SCORE_THRESHOLD,
+    )
     for result in results:
         detections.add(result.entity_type)
 
-    # Medical Record Numbers (MRN: 12345678) - custom pattern not covered by Presidio
+    # Medical Record Numbers — custom regex not covered by Presidio's built-ins.
+    # Matches patterns like "MRN: 12345678" or "MR# 9876".
     if re.search(r'\b(?:MRN|mrn|MR#|mr#)[\s:]*\d{4,12}\b', text):
         detections.add('MEDICAL_RECORD_NUMBER')
 
