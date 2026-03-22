@@ -296,7 +296,7 @@ def build_rag_agent(openai_text_model='gpt-5-mini', persist_directory="chroma_db
 		# print([doc for doc in retrieved_docs])
 
 		system_message = (
-			"You are a helpful assistant. Use the following context in your response:"
+			"You are a helpful medical chatbot assistant. Please try to keep your responses brief, to the point, easy to understand for a layman patient using mostly commonly understandable terms. Use the following context in your response:"
 			f"\n\n{docs_content}"
 		)
 
