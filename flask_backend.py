@@ -580,6 +580,60 @@ def session_end():
     return jsonify({'status': 'saved', 'file': os.path.basename(filename), 'summary': summary}), 200
 
 
+@app.route('/api/sessions', methods=['GET', 'OPTIONS'])
+def list_sessions():
+    """Return metadata for all saved session files, newest first."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    try:
+        files = sorted(
+            [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.json')],
+            reverse=True  # most-recent first (filename contains timestamp)
+        )
+        result = []
+        for fname in files:
+            fpath = os.path.join(SESSIONS_DIR, fname)
+            with open(fpath, 'r') as fp:
+                data = json.load(fp)
+            # Count only the human (user) messages for conciseness
+            messages = data.get('messages', [])
+            user_turns = sum(1 for m in messages if m.get('role') == 'user')
+            result.append({
+                'filename': fname,
+                'session_id': data.get('session_id', ''),
+                'created_at': data.get('created_at', ''),
+                'ended_at': data.get('ended_at', ''),
+                'message_count': len(messages),
+                'user_turns': user_turns,
+                'event_count': len(data.get('events', [])),
+                'summary': data.get('summary', {})
+            })
+        return jsonify({'sessions': result, 'total': len(result)}), 200
+    except Exception as e:
+        logger.error(f"Error listing sessions: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/<path:filename>', methods=['GET', 'OPTIONS'])
+def get_session_detail(filename):
+    """Return the full detail of a single saved session file."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    safe_name = os.path.basename(filename)          # prevent path traversal
+    if not safe_name.endswith('.json'):
+        return jsonify({'error': 'Invalid filename'}), 400
+    fpath = os.path.join(SESSIONS_DIR, safe_name)
+    if not os.path.exists(fpath):
+        return jsonify({'error': 'Session not found'}), 404
+    try:
+        with open(fpath, 'r') as fp:
+            data = json.load(fp)
+        return jsonify(data), 200
+    except Exception as e:
+        logger.error(f"Error reading session {safe_name}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 # ============================================================================
 # STARTUP
 # ============================================================================
