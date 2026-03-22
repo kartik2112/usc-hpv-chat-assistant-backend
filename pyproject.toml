@@ -21,6 +21,7 @@ dependencies = [
     "Flask-APScheduler",
     "presidio-analyzer",
     "presidio-anonymizer",
+    "tzdata",
 ]
 
 [tool.setuptools]

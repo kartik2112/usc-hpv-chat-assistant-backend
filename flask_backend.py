@@ -6,7 +6,8 @@ import os
 import uuid
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from openai import OpenAI
@@ -26,6 +27,29 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Timezone helper — converts UTC ISO strings (as stored in session files) to
+# Pacific Time (America/Los_Angeles handles both PST/UTC-8 and PDT/UTC-7).
+_PACIFIC = ZoneInfo('America/Los_Angeles')
+
+def to_pst(iso_utc: str | None) -> str | None:
+    """Convert a UTC ISO-8601 string to a Pacific-time ISO-8601 string.
+
+    Accepts both naive strings (assumed UTC) and strings ending in 'Z' or
+    '+00:00'. Returns None unchanged so callers don't need to guard."""
+    if not iso_utc:
+        return None
+    try:
+        # Normalise 'Z' suffix which fromisoformat() rejects on Python < 3.11
+        normalised = iso_utc.replace('Z', '+00:00')
+        dt_utc = datetime.fromisoformat(normalised)
+        # If stored as naive (no tzinfo), treat as UTC
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_pst = dt_utc.astimezone(_PACIFIC)
+        return dt_pst.isoformat()
+    except (ValueError, TypeError):
+        return iso_utc  # return original string if parsing fails
 
 class Config(object):
     SCHEDULER_API_ENABLED = True
@@ -730,6 +754,16 @@ def session_end():
         return jsonify({'error': 'session_not_found'}), 404
     if final_messages is not None:
         session_data['messages'] = final_messages
+
+    # Skip persisting sessions that have no actual conversation content
+    user_messages = [
+        m for m in session_data.get('messages', [])
+        if m.get('role') == 'user' and m.get('content', '').strip()
+    ]
+    if not user_messages:
+        logger.info(f"Session {session_id} ended with no user messages — not saving.")
+        return jsonify({'status': 'skipped', 'reason': 'no_messages'}), 200
+
     summary = generate_session_summary(session_data.get('messages', []))
     filename = save_session_to_disk(session_id, session_data, summary)
     logger.info(f"Session {session_id} ended and saved.")
@@ -742,10 +776,10 @@ def list_sessions():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
     try:
-        files = sorted(
-            [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.json')],
-            reverse=True  # most-recent first (filename contains timestamp)
-        )
+        # Load all session JSON files — sort order is applied after reading
+        # so we can sort by the actual created_at ISO timestamp stored inside
+        # each file (sorting by filename would sort by UUID, not by time).
+        files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.json')]
         result = []
         for fname in files:
             fpath = os.path.join(SESSIONS_DIR, fname)
@@ -754,16 +788,24 @@ def list_sessions():
             # Count only the human (user) messages for conciseness
             messages = data.get('messages', [])
             user_turns = sum(1 for m in messages if m.get('role') == 'user')
+            created_at_pst = to_pst(data.get('created_at', ''))
             result.append({
                 'filename': fname,
                 'session_id': data.get('session_id', ''),
-                'created_at': data.get('created_at', ''),
-                'ended_at': data.get('ended_at', ''),
+                'created_at': created_at_pst,
+                'ended_at': to_pst(data.get('ended_at', '')),
                 'message_count': len(messages),
                 'user_turns': user_turns,
                 'event_count': len(data.get('events', [])),
                 'summary': data.get('summary', {})
             })
+        # Sort newest-first by the PST created_at ISO string.
+        # ISO-8601 strings with a consistent offset sort lexicographically
+        # in chronological order, so this is safe.
+        result.sort(
+            key=lambda s: s['created_at'] or '',
+            reverse=True
+        )
         return jsonify({'sessions': result, 'total': len(result)}), 200
     except Exception as e:
         logger.error(f"Error listing sessions: {e}")
@@ -784,6 +826,9 @@ def get_session_detail(filename):
     try:
         with open(fpath, 'r') as fp:
             data = json.load(fp)
+        # Convert stored UTC timestamps to PST before returning
+        data['created_at'] = to_pst(data.get('created_at'))
+        data['ended_at']   = to_pst(data.get('ended_at'))
         return jsonify(data), 200
     except Exception as e:
         logger.error(f"Error reading session {safe_name}: {e}")

@@ -1,1 +1,1 @@
-web: /opt/render/project/src/.venv/bin/gunicorn flask_backend:app --workers 1 --threads 2 --timeout 300 --bind 0.0.0.0:$PORT
+web: /opt/render/project/src/.venv/bin/gunicorn flask_backend:app --workers 10 --threads 6 --timeout 300 --bind 0.0.0.0:$PORT
