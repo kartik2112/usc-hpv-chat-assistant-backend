@@ -33,19 +33,33 @@ app = Flask(__name__)
 app.config.from_object(Config())
 scheduler = APScheduler()
 
-# CORS Configuration - Allow requests from your frontend
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "http://localhost:3000",  # Local development
-            "http://localhost:5000",  # Local development
-            "https://kartik2112.github.io",  # Replace with your domain
-            "*"  # For testing only - restrict in production
-        ],
-        "methods": ["POST", "GET", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization"]
-    }
-})
+# CORS Configuration
+# flask-cors origins="*" (string) allows all origins.
+# A list containing "*" does NOT work as a wildcard — it only matches the
+# literal string "*" as an Origin header, which browsers never send.
+CORS(app, origins="*", methods=["GET", "POST", "OPTIONS"],
+     allow_headers=["Content-Type", "Authorization"])
+
+ALLOWED_ORIGINS = {
+    "http://localhost:3000",
+    "http://localhost:5000",
+    "https://kartik2112.github.io",
+    "https://dipsurvey-ann.isi.edu",
+    "https://sackend.isi.edu",
+}
+
+@app.after_request
+def ensure_cors_headers(response):
+    """Guarantee CORS headers on every response, including error responses
+    that bypass the flask-cors middleware."""
+    origin = request.headers.get("Origin", "")
+    # Echo back the specific origin when known; fall back to * for unknown origins.
+    response.headers["Access-Control-Allow-Origin"] = (
+        origin if origin in ALLOWED_ORIGINS else "*"
+    )
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    return response
 
 # Initialize OpenAI client with API key from environment variable
 # NEVER hardcode API keys in code
