@@ -33,30 +33,39 @@ app = Flask(__name__)
 app.config.from_object(Config())
 scheduler = APScheduler()
 
-# CORS Configuration
-# flask-cors origins="*" (string) allows all origins.
-# A list containing "*" does NOT work as a wildcard — it only matches the
-# literal string "*" as an Origin header, which browsers never send.
+# ---------------------------------------------------------------------------
+# CORS — allow all origins unconditionally.
+#
+# Why "*" and not a list of specific origins?
+#
+#   This API uses server-side secrets (OPENAI_API_KEY stored in Render's
+#   environment). The browser never sends credentials (cookies, auth headers)
+#   so there is no security risk in using a wildcard origin.
+#
+#   The browser's CORS check only protects against *other websites reading
+#   your responses*. Since every response here is meant to be read by the
+#   calling page (kartik2112.github.io), allowing all origins is correct.
+#
+#   Restricting to a list would only matter if the API issued auth tokens
+#   tied to the browser session — it doesn't.
+#
+# How CORS works (short version):
+#   1. Browser sends a preflight OPTIONS request asking "can I call you?".
+#   2. Server replies with Access-Control-Allow-Origin: *.
+#   3. Browser sees * → allows the real GET/POST request to proceed.
+#   4. Without the header the browser blocks the response in JS — the server
+#      still received and processed the request, the client just can't read it.
+#
+# The @app.after_request hook guarantees the header is present on *every*
+# response Flask ever sends, including unhandled 500 errors that bypass the
+# flask-cors middleware.
+# ---------------------------------------------------------------------------
 CORS(app, origins="*", methods=["GET", "POST", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization"])
 
-ALLOWED_ORIGINS = {
-    "http://localhost:3000",
-    "http://localhost:5000",
-    "https://kartik2112.github.io",
-    "https://dipsurvey-ann.isi.edu",
-    "https://sackend.isi.edu",
-}
-
 @app.after_request
 def ensure_cors_headers(response):
-    """Guarantee CORS headers on every response, including error responses
-    that bypass the flask-cors middleware."""
-    origin = request.headers.get("Origin", "")
-    # Echo back the specific origin when known; fall back to * for unknown origins.
-    response.headers["Access-Control-Allow-Origin"] = (
-        origin if origin in ALLOWED_ORIGINS else "*"
-    )
+    response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
     return response
