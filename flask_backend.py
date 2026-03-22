@@ -3,6 +3,10 @@
 # Install: pip install flask flask-cors openai python-dotenv
 
 import os
+import uuid
+import json
+import threading
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from openai import OpenAI
@@ -91,6 +95,89 @@ def detect_phi_backend(text):
         detections.add('MEDICAL_RECORD_NUMBER')
 
     return list(detections)
+
+
+# ============================================================================
+# SESSION MANAGEMENT
+# ============================================================================
+
+SESSIONS_DIR = 'sessions'
+SESSION_TIMEOUT_MINUTES = 2
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+sessions = {}          # { session_id: { events, messages, last_activity, created_at } }
+sessions_lock = threading.Lock()
+
+
+def generate_session_summary(messages):
+    """Call the LLM to produce a patient-questions + doctor-action-items summary."""
+    if not messages:
+        return {"patient_questions": "No conversation recorded.", "action_items": ""}
+    conversation_text = "\n".join(
+        f"{m['role'].upper()}: {m['content']}" for m in messages
+    )
+    summary_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are a clinical documentation assistant. Given a patient–assistant "
+                "conversation about HPV, produce a concise JSON summary with exactly two fields:\n"
+                "1. 'patient_questions': A bullet-point list of the main questions and concerns "
+                "raised by the patient.\n"
+                "2. 'action_items': A bullet-point list of follow-up action items for the "
+                "healthcare provider to initiate the conversation in that direction.\n"
+                "Return ONLY valid JSON. Example:\n"
+                '{"patient_questions": "• Question 1\\n• Question 2", '
+                '"action_items": "• Action 1\\n• Action 2"}'
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Conversation:\n{conversation_text}"
+        }
+    ]
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_TEXT_MODEL,
+            messages=summary_prompt,
+            max_completion_tokens=500
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        logger.error(f"Summary generation failed: {e}")
+        return {"patient_questions": "Summary unavailable.", "action_items": ""}
+
+
+def save_session_to_disk(session_id, session_data, summary):
+    """Write session JSON to the sessions/ folder on the server."""
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
+    payload = {
+        "session_id": session_id,
+        "created_at": session_data["created_at"].isoformat(),
+        "ended_at": datetime.utcnow().isoformat(),
+        "events": session_data.get("events", []),
+        "messages": session_data.get("messages", []),
+        "summary": summary
+    }
+    with open(filename, 'w') as f:
+        json.dump(payload, f, indent=2)
+    logger.info(f"Session {session_id} saved → {filename}")
+    return filename
+
+
+def auto_expire_sessions():
+    """APScheduler job: expire sessions inactive for > SESSION_TIMEOUT_MINUTES."""
+    cutoff = datetime.utcnow() - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    with sessions_lock:
+        expired_ids = [sid for sid, s in sessions.items() if s["last_activity"] < cutoff]
+    for sid in expired_ids:
+        with sessions_lock:
+            session_data = sessions.pop(sid, None)
+        if session_data:
+            summary = generate_session_summary(session_data.get("messages", []))
+            save_session_to_disk(sid, session_data, summary)
+            logger.info(f"Auto-expired session {sid}")
 
 
 @app.route("/", methods=["GET"])
@@ -419,9 +506,91 @@ def get_mode():
         'instructions': 'To switch modes, update AUDIO_MODE variable and redeploy'
     }), 200
 
+
+# ============================================================================
+# SESSION MANAGEMENT ROUTES
+# ============================================================================
+
+@app.route('/api/session/start', methods=['POST', 'OPTIONS'])
+def session_start():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    session_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+    with sessions_lock:
+        sessions[session_id] = {
+            'events': [],
+            'messages': [],
+            'last_activity': now,
+            'created_at': now
+        }
+    logger.info(f"Session started: {session_id}")
+    return jsonify({'session_id': session_id}), 200
+
+
+@app.route('/api/session/activity', methods=['POST', 'OPTIONS'])
+def session_activity():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    data = request.get_json() or {}
+    session_id = data.get('session_id')
+    with sessions_lock:
+        if session_id not in sessions:
+            return jsonify({'error': 'session_expired'}), 404
+        sessions[session_id]['last_activity'] = datetime.utcnow()
+    return jsonify({'status': 'ok'}), 200
+
+
+@app.route('/api/session/log', methods=['POST', 'OPTIONS'])
+def session_log():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    data = request.get_json() or {}
+    session_id = data.get('session_id')
+    event = data.get('event')          # single event object (optional)
+    messages = data.get('messages')    # full messages array (optional)
+    with sessions_lock:
+        if session_id not in sessions:
+            return jsonify({'error': 'session_expired'}), 404
+        sessions[session_id]['last_activity'] = datetime.utcnow()
+        if event:
+            sessions[session_id]['events'].append(event)
+        if messages is not None:
+            sessions[session_id]['messages'] = messages
+    return jsonify({'status': 'ok'}), 200
+
+
+@app.route('/api/session/end', methods=['POST', 'OPTIONS'])
+def session_end():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    data = request.get_json() or {}
+    session_id = data.get('session_id')
+    # Allow caller to push a final messages snapshot
+    final_messages = data.get('messages')
+    with sessions_lock:
+        session_data = sessions.pop(session_id, None)
+    if not session_data:
+        return jsonify({'error': 'session_not_found'}), 404
+    if final_messages is not None:
+        session_data['messages'] = final_messages
+    summary = generate_session_summary(session_data.get('messages', []))
+    filename = save_session_to_disk(session_id, session_data, summary)
+    logger.info(f"Session {session_id} ended and saved.")
+    return jsonify({'status': 'saved', 'file': os.path.basename(filename), 'summary': summary}), 200
+
+
 # ============================================================================
 # STARTUP
 # ============================================================================
+
+# Initialise scheduler at module level so it runs under both Flask dev server
+# and gunicorn (single-worker) without needing if __name__ == '__main__'.
+scheduler.init_app(app)
+scheduler.add_job(id='daily_task_1am', func=daily_task, trigger='cron', hour=1, minute=0)
+scheduler.add_job(id='session_cleanup', func=auto_expire_sessions,
+                  trigger='interval', seconds=30)
+scheduler.start()
 
 if __name__ == '__main__':
     print("="*80)
@@ -445,12 +614,6 @@ if __name__ == '__main__':
     print("   ✓ /health (status)")
     print("   ✓ /mode (mode information)")
     print("\n" + "="*80)
-
-    # app.run(debug=True, host='0.0.0.0', port=5000)
-    scheduler.init_app(app)
-    # Schedule the job to run every day at 1:00 AM
-    scheduler.add_job(id='daily_task_1am', func=daily_task, trigger='cron', hour=1, minute=0)
-    scheduler.start()
 
     # When running with app.run(), set use_reloader=False to prevent jobs from running twice
     app.run(use_reloader=False) 
