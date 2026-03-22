@@ -149,21 +149,93 @@ def generate_session_summary(messages):
 
 
 def save_session_to_disk(session_id, session_data, summary):
-    """Write session JSON to the sessions/ folder on the server."""
+    """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
+    ended_at  = datetime.utcnow()
+    created_at = session_data["created_at"]
+
+    # ── JSON ──────────────────────────────────────────────────────────────────
+    json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
     payload = {
         "session_id": session_id,
-        "created_at": session_data["created_at"].isoformat(),
-        "ended_at": datetime.utcnow().isoformat(),
-        "events": session_data.get("events", []),
-        "messages": session_data.get("messages", []),
-        "summary": summary
+        "created_at": created_at.isoformat(),
+        "ended_at":   ended_at.isoformat(),
+        "events":     session_data.get("events", []),
+        "messages":   session_data.get("messages", []),
+        "summary":    summary
     }
-    with open(filename, 'w') as f:
+    with open(json_filename, 'w') as f:
         json.dump(payload, f, indent=2)
-    logger.info(f"Session {session_id} saved → {filename}")
-    return filename
+
+    # ── TXT ───────────────────────────────────────────────────────────────────
+    txt_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.txt")
+
+    duration_secs = int((ended_at - created_at).total_seconds())
+    duration_str  = f"{duration_secs // 60}m {duration_secs % 60}s"
+
+    lines = [
+        "HPV Health Assistant — Session Transcript",
+        "=" * 60,
+        f"Session ID : {session_id}",
+        f"Started    : {created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"Ended      : {ended_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        f"Duration   : {duration_str}",
+        "",
+        "─" * 60,
+        "CONVERSATION",
+        "─" * 60,
+    ]
+    messages = session_data.get("messages", [])
+    if messages:
+        for msg in messages:
+            role    = "Patient" if msg.get("role") == "user" else "Assistant"
+            content = (msg.get("content") or "").strip()
+            lines.append(f"\n[{role}]")
+            lines.append(content)
+    else:
+        lines.append("(no messages recorded)")
+
+    lines += [
+        "",
+        "─" * 60,
+        "EVENT LOG",
+        "─" * 60,
+    ]
+    events = session_data.get("events", [])
+    if events:
+        for evt in events:
+            try:
+                offset = int((datetime.fromisoformat(evt.get("timestamp", ended_at.isoformat()))
+                              - created_at).total_seconds())
+                offset_str = f"+{offset // 60}m{offset % 60}s" if offset >= 60 else f"+{offset}s"
+            except Exception:
+                offset_str = "?"
+            evt_type = evt.get("type", "")
+            lang     = evt.get("language", "")
+            details  = evt.get("details", "")
+            lines.append(f"{offset_str:<10} {evt_type:<30} {lang:<6} {details}")
+    else:
+        lines.append("(no events recorded)")
+
+    lines += [
+        "",
+        "─" * 60,
+        "SUMMARY",
+        "─" * 60,
+        "",
+        "Patient Questions:",
+        summary.get("patient_questions", "—"),
+        "",
+        "Provider Action Items:",
+        summary.get("action_items", "—"),
+        "",
+    ]
+
+    with open(txt_filename, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+    logger.info(f"Session {session_id} saved → {json_filename} + {txt_filename}")
+    return json_filename
 
 
 def auto_expire_sessions():
