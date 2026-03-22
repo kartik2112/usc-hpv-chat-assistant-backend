@@ -243,11 +243,15 @@ def generate_session_summary(messages):
         response = client.chat.completions.create(
             model=OPENAI_TEXT_MODEL,
             messages=summary_prompt,
-            max_completion_tokens=500
+            max_completion_tokens=5000,
+            response_format={"type": "json_object"}   # forces raw JSON — no markdown fences
         )
-        return json.loads(response.choices[0].message.content)
+        raw = (response.choices[0].message.content or "").strip()
+        if not raw:
+            raise ValueError("LLM returned empty content")
+        return json.loads(raw)
     except Exception as e:
-        logger.error(f"Summary generation failed: {e}")
+        logger.error(f"Summary generation failed: {e}\nResponse received: {response}")
         return {"patient_questions": "Summary unavailable.", "action_items": ""}
 
 
