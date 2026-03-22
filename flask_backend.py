@@ -110,11 +110,26 @@ sessions_lock = threading.Lock()
 
 
 def generate_session_summary(messages):
-    """Call the LLM to produce a patient-questions + doctor-action-items summary."""
+    """Call the LLM to produce a patient-questions + doctor-action-items summary.
+
+    PHI-flagged messages are stripped before sending to the LLM as a
+    defence-in-depth measure (the frontend should not store them in the
+    session at all, but we filter here too to be safe).
+    """
     if not messages:
         return {"patient_questions": "No conversation recorded.", "action_items": ""}
+
+    # Remove any message whose content contains PHI so it is never sent to the LLM.
+    clean_messages = [
+        m for m in messages
+        if not detect_phi_backend(m.get("content", ""))
+    ]
+
+    if not clean_messages:
+        return {"patient_questions": "No conversation recorded.", "action_items": ""}
+
     conversation_text = "\n".join(
-        f"{m['role'].upper()}: {m['content']}" for m in messages
+        f"{m['role'].upper()}: {m['content']}" for m in clean_messages
     )
     summary_prompt = [
         {
@@ -154,6 +169,12 @@ def save_session_to_disk(session_id, session_data, summary):
     ended_at  = datetime.utcnow()
     created_at = session_data["created_at"]
 
+    # Strip PHI-flagged messages before writing to disk (defence-in-depth).
+    clean_messages = [
+        m for m in session_data.get("messages", [])
+        if not detect_phi_backend(m.get("content", ""))
+    ]
+
     # ── JSON ──────────────────────────────────────────────────────────────────
     json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
     payload = {
@@ -161,7 +182,7 @@ def save_session_to_disk(session_id, session_data, summary):
         "created_at": created_at.isoformat(),
         "ended_at":   ended_at.isoformat(),
         "events":     session_data.get("events", []),
-        "messages":   session_data.get("messages", []),
+        "messages":   clean_messages,
         "summary":    summary
     }
     with open(json_filename, 'w') as f:
@@ -185,9 +206,8 @@ def save_session_to_disk(session_id, session_data, summary):
         "CONVERSATION",
         "─" * 60,
     ]
-    messages = session_data.get("messages", [])
-    if messages:
-        for msg in messages:
+    if clean_messages:
+        for msg in clean_messages:
             role    = "Patient" if msg.get("role") == "user" else "Assistant"
             content = (msg.get("content") or "").strip()
             lines.append(f"\n[{role}]")
