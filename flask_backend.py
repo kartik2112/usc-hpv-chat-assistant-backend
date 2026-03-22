@@ -325,7 +325,10 @@ def generate_session_summary(messages):
                     "1. 'patient_questions': A bullet-point list of the main questions and concerns "
                     "raised by the patient.\n"
                     "2. 'action_items': A bullet-point list of follow-up action items for the "
-                    "healthcare provider to initiate the conversation in that direction.\n"
+                    "healthcare provider to initiate the conversation in that direction. "
+                    "These should only be with respect to questions that indicate misconceptions about "
+                    "HPV the patient demonstrated with their questions. "
+                    "Please refrain from converting every question into an action item. Keep this extremely brief, concise and to the point.\n"
                     "Return ONLY valid JSON. Example:\n"
                     '{"patient_questions": "• Question 1\\n• Question 2", '
                     '"action_items": "• Action 1\\n• Action 2"}'
