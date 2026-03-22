@@ -6,8 +6,13 @@ import os
 import uuid
 import json
 import threading
+import hmac
+import hashlib
+import time
+import secrets
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from functools import wraps
 from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from openai import OpenAI
@@ -15,6 +20,7 @@ from dotenv import load_dotenv
 import io
 import re
 import logging
+import bcrypt
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer.nlp_engine import NlpEngineProvider
 from flask_apscheduler import APScheduler
@@ -229,6 +235,62 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 sessions = {}          # { session_id: { events, messages, last_activity, created_at } }
 sessions_lock = threading.Lock()
+
+# ── Sessions Dashboard Auth ───────────────────────────────────────────────────
+# Password hash is stored as an environment variable — never in source code.
+# To generate a hash for your chosen password run:
+#   python3 -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_PASSWORD', bcrypt.gensalt(rounds=12)).decode())"
+# Then set SESSIONS_PASSWORD_HASH=<output> in Render's environment variables.
+#
+# SESSIONS_TOKEN_SECRET is used to sign dashboard access tokens.
+# Set it to any long random string in Render's environment variables, e.g.:
+#   python3 -c "import secrets; print(secrets.token_hex(32))"
+# If not set, a random secret is generated at startup (tokens won't survive restarts).
+SESSIONS_PASSWORD_HASH = os.environ.get('SESSIONS_PASSWORD_HASH', '')
+SESSIONS_TOKEN_SECRET  = os.environ.get('SESSIONS_TOKEN_SECRET', secrets.token_hex(32))
+SESSIONS_TOKEN_EXPIRY  = 7200   # 2 hours in seconds
+
+# In-memory rate-limit store: { ip: (failure_count, lockout_until_unix) }
+_auth_rate_limit: dict = {}
+_AUTH_MAX_FAILURES = 5
+_AUTH_LOCKOUT_SECONDS = 900   # 15 minutes
+
+
+def _make_dashboard_token() -> str:
+    """Return a signed, expiring token for dashboard access."""
+    expiry = str(int(time.time()) + SESSIONS_TOKEN_EXPIRY)
+    sig = hmac.new(SESSIONS_TOKEN_SECRET.encode(), expiry.encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+
+def _validate_dashboard_token(token: str) -> bool:
+    """Return True iff the token is unexpired and its HMAC is valid."""
+    if not token:
+        return False
+    try:
+        expiry_str, sig = token.rsplit('.', 1)
+        expiry = int(expiry_str)
+    except (ValueError, AttributeError):
+        return False
+    if expiry < int(time.time()):
+        return False
+    expected = hmac.new(SESSIONS_TOKEN_SECRET.encode(), expiry_str.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(sig, expected)
+
+
+def require_dashboard_token(f):
+    """Decorator: reject requests that don't carry a valid dashboard token.
+    OPTIONS preflights are always passed through so CORS handshakes work."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.method == 'OPTIONS':
+            return f(*args, **kwargs)   # let the route handle the preflight
+        auth_header = request.headers.get('Authorization', '')
+        token = auth_header.removeprefix('Bearer ').strip()
+        if not _validate_dashboard_token(token):
+            return jsonify({'error': 'Unauthorized. Please authenticate.'}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 
 def generate_session_summary(messages):
@@ -808,7 +870,54 @@ def session_end():
     return jsonify({'status': 'saved', 'file': os.path.basename(filename), 'summary': summary}), 200
 
 
+@app.route('/api/sessions/auth', methods=['POST', 'OPTIONS'])
+def sessions_auth():
+    """Validate the dashboard password and return a signed access token."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    if not SESSIONS_PASSWORD_HASH:
+        return jsonify({'error': 'Sessions dashboard not configured — set SESSIONS_PASSWORD_HASH env var.'}), 503
+
+    # ── IP-based rate limiting ────────────────────────────────────────────────
+    ip = request.remote_addr or 'unknown'
+    now = int(time.time())
+    failures, lockout_until = _auth_rate_limit.get(ip, (0, 0))
+    if lockout_until > now:
+        remaining = lockout_until - now
+        return jsonify({'error': f'Too many failed attempts. Try again in {remaining}s.'}), 429
+
+    # ── Validate password ─────────────────────────────────────────────────────
+    body = request.get_json(silent=True) or {}
+    password = body.get('password', '')
+    if not password:
+        return jsonify({'error': 'Password required.'}), 400
+
+    try:
+        valid = bcrypt.checkpw(password.encode('utf-8'), SESSIONS_PASSWORD_HASH.encode('utf-8'))
+    except Exception as exc:
+        logger.error(f"bcrypt error: {exc}")
+        return jsonify({'error': 'Server password configuration error.'}), 500
+
+    if not valid:
+        failures += 1
+        lockout = (now + _AUTH_LOCKOUT_SECONDS) if failures >= _AUTH_MAX_FAILURES else 0
+        _auth_rate_limit[ip] = (failures, lockout)
+        remaining_attempts = max(0, _AUTH_MAX_FAILURES - failures)
+        return jsonify({
+            'error': 'Incorrect password.',
+            'attempts_remaining': remaining_attempts
+        }), 401
+
+    # ── Success — clear rate limit, issue token ───────────────────────────────
+    _auth_rate_limit.pop(ip, None)
+    token = _make_dashboard_token()
+    logger.info(f"Dashboard auth success from {ip}")
+    return jsonify({'token': token, 'expires_in': SESSIONS_TOKEN_EXPIRY}), 200
+
+
 @app.route('/api/sessions', methods=['GET', 'OPTIONS'])
+@require_dashboard_token
 def list_sessions():
     """Return metadata for all saved session files, newest first."""
     if request.method == 'OPTIONS':
@@ -851,6 +960,7 @@ def list_sessions():
 
 
 @app.route('/api/sessions/<path:filename>', methods=['GET', 'OPTIONS'])
+@require_dashboard_token
 def get_session_detail(filename):
     """Return the full detail of a single saved session file."""
     if request.method == 'OPTIONS':

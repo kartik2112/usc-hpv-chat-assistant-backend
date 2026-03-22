@@ -22,6 +22,7 @@ dependencies = [
     "presidio-analyzer",
     "presidio-anonymizer",
     "tzdata",
+    "bcrypt",
 ]
 
 [tool.setuptools]
