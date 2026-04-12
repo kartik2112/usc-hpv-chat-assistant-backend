@@ -21,8 +21,6 @@ import io
 import re
 import logging
 import bcrypt
-from presidio_analyzer import AnalyzerEngine
-from presidio_analyzer.nlp_engine import NlpEngineProvider
 from flask_apscheduler import APScheduler
 
 from rag_pipeline import ask_rag_question, build_rag_agent
@@ -33,6 +31,17 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Deployment environment detection
+#
+# Render automatically injects RENDER=true into every service's environment.
+# We use this to skip loading the presidio_analyzer + spaCy PHI detection
+# engine on Render (512 MB RAM limit) and only enable it on sackend.isi.edu,
+# which has sufficient memory.
+# ---------------------------------------------------------------------------
+IS_RENDER   = bool(os.getenv("RENDER"))          # True on onrender.com
+PHI_ENABLED = not IS_RENDER                       # False on Render, True on sackend
 
 # Timezone helper — converts UTC ISO strings (as stored in session files) to
 # Pacific Time (America/Los_Angeles handles both PST/UTC-8 and PDT/UTC-7).
@@ -162,11 +171,21 @@ def daily_task():
     print("Daily RAG Refresh task is running...")
     rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
-_nlp_engine = NlpEngineProvider(nlp_configuration={
-    "nlp_engine_name": "spacy",
-    "models": [{"lang_code": "en", "model_name": "en_core_web_md"}],
-}).create_engine()
-pii_analysis_service = AnalyzerEngine(nlp_engine=_nlp_engine)
+# PHI detection engine — only loaded on sackend (not on Render).
+# presidio_analyzer + spaCy's en_core_web_md model consumes ~300 MB of RAM,
+# which exhausts the 512 MB limit on Render's free tier and causes OOM crashes.
+if PHI_ENABLED:
+    from presidio_analyzer import AnalyzerEngine
+    from presidio_analyzer.nlp_engine import NlpEngineProvider
+    _nlp_engine = NlpEngineProvider(nlp_configuration={
+        "nlp_engine_name": "spacy",
+        "models": [{"lang_code": "en", "model_name": "en_core_web_md"}],
+    }).create_engine()
+    pii_analysis_service = AnalyzerEngine(nlp_engine=_nlp_engine)
+    logger.info("PHI detection engine loaded (sackend deployment — PHI_ENABLED=True)")
+else:
+    pii_analysis_service = None
+    logger.info("PHI detection disabled (Render deployment — PHI_ENABLED=False, saving ~300 MB RAM)")
 
 # ---------------------------------------------------------------------------
 # Explicit HIPAA PHI entity allowlist
@@ -201,11 +220,18 @@ PHI_SCORE_THRESHOLD = 0.80
 def detect_phi_backend(text):
     """Detect HIPAA-relevant PHI in text using Presidio + spaCy (local only).
 
-    Returns a list of detected entity type strings, or an empty list when no
-    PHI is found. Only the entity types in HIPAA_PHI_ENTITIES are checked,
-    and only detections above PHI_SCORE_THRESHOLD are reported — this
-    prevents medical acronyms like 'HPV' from triggering false positives.
+    Returns an empty list immediately when PHI_ENABLED is False (Render
+    deployment), so no memory is consumed by the NLP model on that host.
+
+    On sackend (PHI_ENABLED=True) it returns a list of detected entity type
+    strings, or an empty list when no PHI is found. Only the entity types in
+    HIPAA_PHI_ENTITIES are checked, and only detections above
+    PHI_SCORE_THRESHOLD are reported — this prevents medical acronyms like
+    'HPV' from triggering false positives.
     """
+    if not PHI_ENABLED:
+        return []
+
     detections = set()
 
     results = pii_analysis_service.analyze(
@@ -323,11 +349,12 @@ def generate_session_summary(messages):
                     "You are a clinical documentation assistant. Given a patient–assistant "
                     "conversation about HPV, produce a concise JSON summary with exactly two fields:\n"
                     "1. 'patient_questions': A bullet-point list of the main questions and concerns "
-                    "raised by the patient.\n"
+                    "raised by the patient. (ONLY CAPTURE QUESTIONS ASKED BY THE USER IN THE JSON. DO NO HALLUCINATE. DO NOT ADD ANY ADDITIONAL QUESTIONS)\n"
                     "2. 'action_items': A bullet-point list of follow-up action items for the "
                     "healthcare provider to initiate the conversation in that direction. "
                     "These should only be with respect to questions that indicate misconceptions about "
                     "HPV the patient demonstrated with their questions. "
+                    "Do not capture all possible actions that a provider should do. Focus on the few most important ones based on the conversation. "
                     "Please refrain from converting every question into an action item. Keep this extremely brief, concise and to the point.\n"
                     "Return ONLY valid JSON. Example:\n"
                     '{"patient_questions": "• Question 1\\n• Question 2", '
