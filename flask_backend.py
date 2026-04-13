@@ -240,7 +240,7 @@ HIPAA_PHI_ENTITIES = [
 # incorrectly labels medical acronyms (HPV, HER2, BRCA, …) as names.
 # Genuine names in conversational text ("My name is Jane Doe") consistently
 # score ≥ 0.85, so real PHI is still caught.
-PHI_SCORE_THRESHOLD = 0.80
+PHI_SCORE_THRESHOLD = 0.85
 
 
 def detect_phi_backend(text, language="en"):
@@ -277,6 +277,16 @@ def detect_phi_backend(text, language="en"):
         score_threshold=PHI_SCORE_THRESHOLD,
     )
     for result in results:
+        # For PERSON entities, require the matched span to contain at least two
+        # whitespace-separated tokens (e.g. "Jane Doe", "Dr. García").
+        # Single capitalised words — such as "Importante" in Spanish or medical
+        # abbreviations — are routinely mis-tagged as person names by spaCy's NER
+        # models in both English and Spanish.  Real patient / provider names in
+        # conversational text virtually always include a first AND last name.
+        if result.entity_type == "PERSON":
+            matched_text = text[result.start:result.end].strip()
+            if len(matched_text.split()) < 2:
+                continue
         detections.add(result.entity_type)
 
     # Medical Record Numbers — custom regex not covered by Presidio's built-ins.
