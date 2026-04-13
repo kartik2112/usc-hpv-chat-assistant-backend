@@ -300,9 +300,11 @@ def build_rag_agent(openai_text_model='gpt-5-mini', persist_directory="chroma_db
 			f"\n\n{docs_content}"
 		)
 
-		return system_message	
+		return system_message
 	agent = create_agent(model=rag_pipeline.openai_text_model, tools=[], middleware=[_prompt_with_context])
-	return agent
+	# Return the pipeline alongside the agent so callers can use it for
+	# streaming (ask_rag_question_stream) without having to rebuild it.
+	return agent, rag_pipeline
 
 
 def ask_rag_question(agent, messages):
@@ -314,3 +316,60 @@ def ask_rag_question(agent, messages):
 		return result['messages'][-1]
 	except Exception as e:
 		raise Exception(f"Error generating response: {str(e)}")
+
+
+def ask_rag_question_stream(pipeline, messages):
+	"""Generator that yields raw text tokens for a streaming RAG response.
+
+	Performs the same retrieval step as the non-streaming path (similarity
+	search → inject as system context) but then calls ChatOpenAI.stream()
+	instead of invoke() so the caller can forward each token to the client
+	as a Server-Sent Event without waiting for the full completion.
+
+	Args:
+		pipeline: The HPVRAGPipeline instance returned by build_rag_agent().
+		messages: The conversation messages list (OpenAI dict format).
+
+	Yields:
+		str: Each text token/chunk from the LLM as it is produced.
+	"""
+	# Extract the last user turn for retrieval
+	last_query = ""
+	for m in reversed(messages):
+		if isinstance(m, dict) and m.get("role") == "user":
+			last_query = m.get("content", "")
+			break
+
+	# Retrieve relevant documents (mirrors _prompt_with_context middleware)
+	retrieved_docs = pipeline.vector_store.similarity_search(last_query)
+	docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
+
+	system_message = (
+		"You are a helpful medical chatbot assistant. Please try to keep your responses brief, "
+		"to the point, easy to understand for a layman patient using mostly commonly understandable terms. "
+		"Use the following context in your response:"
+		f"\n\n{docs_content}"
+	)
+
+	# Build the message list for the LLM.
+	# The frontend always prepends its own generic system message; we replace it
+	# with the RAG-context system message so there is exactly one system turn.
+	lc_messages = [{"role": "system", "content": system_message}]
+	for m in messages:
+		if isinstance(m, dict) and m.get("role") != "system":
+			lc_messages.append({"role": m.get("role"), "content": m.get("content", "")})
+
+	# Stream token-by-token from the LLM.
+	# chunk.content is normally a str, but in some LangChain / model
+	# combinations it can be a list of content blocks.  Handle both.
+	for chunk in pipeline.response_llm.stream(lc_messages):
+		content = chunk.content
+		if isinstance(content, str):
+			if content:
+				yield content
+		elif isinstance(content, list):
+			for block in content:
+				if isinstance(block, dict) and block.get("type") == "text":
+					text = block.get("text", "")
+					if text:
+						yield text

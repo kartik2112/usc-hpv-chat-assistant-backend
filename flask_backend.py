@@ -13,7 +13,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from functools import wraps
-from flask import Flask, request, jsonify, send_file, make_response
+from flask import Flask, request, jsonify, send_file, make_response, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -23,7 +23,7 @@ import logging
 import bcrypt
 from flask_apscheduler import APScheduler
 
-from rag_pipeline import ask_rag_question, build_rag_agent
+from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -163,13 +163,14 @@ if not openai_api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set!")
 
 client = OpenAI(api_key=openai_api_key)
-rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
+rag_agent, _rag_pipeline = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
 
 def daily_task():
     """Your daily logic goes here (e.g., making an API call, cleaning up data)"""
+    global rag_agent, _rag_pipeline
     print("Daily RAG Refresh task is running...")
-    rag_agent = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
+    rag_agent, _rag_pipeline = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
 
 # PHI detection engine — only loaded on sackend (not on Render).
 # presidio_analyzer + spaCy's en_core_web_md model consumes ~300 MB of RAM,
@@ -537,134 +538,110 @@ def home():
 @app.route("/api/chat", methods=["POST", "OPTIONS"])
 def chat():
     """
-    Proxy endpoint for OpenAI Chat Completions
-    
-    Expected JSON payload:
-    {
-        "messages": [
-            {"role": "system", "content": "You are..."},
-            {"role": "user", "content": "Hello"}
-        ],
-        "model": "gpt-3.5-turbo",
-        "max_tokens": 800,
-        "temperature": 0.7
-    }
+    Streaming proxy endpoint for RAG-powered chat completions.
 
-    Expected JSON payload:
-    {
-        "messages": [
-            {"role": "system", "content": "You are..."},
-            {"role": "user", "content": "Hello"}
-        ],
-        "model": "gpt-5-mini",
-        "max_tokens": 800
-    }
+    Accepts the same JSON payload as before:
+        { "messages": [...], "language": "en"|"es", ... }
+
+    Returns a Server-Sent Events (text/event-stream) response so the
+    frontend can render tokens as they arrive.  Each SSE event carries a
+    JSON payload with a "type" discriminator:
+
+        {"type": "token",       "token": "<text chunk>"}
+        {"type": "done",        "message": "<full text>", "rag_used": true,
+                                "phi_warning": false, "phi_types": []}
+        {"type": "phi_warning", "message": "<warning text>",
+                                "phi_warning": true, "phi_types": [...]}
+        {"type": "error",       "error": "<message>"}
     """
-    
+
     # Handle CORS preflight
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    
-    try:
-        # Get request data
-        data = request.get_json()
-        
-        # Validate required fields
-        if not data or "messages" not in data:
-            return jsonify({
-                "error": "Missing 'messages' field in request"
-            }), 400
-        
-        messages = data.get("messages", [])
-        # temperature = data.get("temperature", 0.7)
 
-        # Language sent by the client ("en" or "es"). Used to select the
-        # correct spaCy model inside detect_phi_backend().
-        language = data.get("language", "en")
+    data = request.get_json()
+    if not data or "messages" not in data:
+        return jsonify({"error": "Missing 'messages' field in request"}), 400
 
-        # Detect PHI/PII in the latest user message (local only, no external calls)
-        phi_warning = False
-        phi_types = []
-        if messages:
-            last_user_msg = next(
-                (m['content'] for m in reversed(messages) if m.get('role') == 'user'),
-                None
-            )
-            if last_user_msg:
-                phi_types = detect_phi_backend(last_user_msg, language=language)
-                if phi_types:
-                    phi_warning = True
-                    logger.warning(f"PHI detected in user message: {phi_types}")
+    messages = data.get("messages", [])
 
-        # Call OpenAI API (API key is securely stored on backend)
-        # response = client.chat.completions.create(
-        #     model=OPENAI_TEXT_MODEL,
-        #     messages=messages,
-        #     max_completion_tokens=MAX_COMPLETION_TOKENS,
-        #     # temperature=temperature
-        # )
-        
-        # # Extract response content
-        # assistant_message = response.choices[0].message.content
+    # Language sent by the client ("en" or "es"). Used to select the
+    # correct spaCy model inside detect_phi_backend().
+    language = data.get("language", "en")
 
-        # If PHI detected, block the RAG call and return a warning message instead
-        if phi_warning:
-            return jsonify({
-                "success": True,
-                "message": "It looks like your message may contain personal information. "
-                           "For your privacy, please remove any personal details (such as names, "
-                           "phone numbers, addresses, or dates of birth) and try again.",
-                "usage": {
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
-                    "total_tokens": 0
-                },
-                "rag_used": False,
-                "phi_warning": phi_warning,
-                "phi_types": phi_types
-            }), 200
+    # ── PHI check (fast, synchronous — runs before the stream opens) ─────────
+    phi_warning = False
+    phi_types   = []
+    if messages:
+        last_user_msg = next(
+            (m['content'] for m in reversed(messages) if m.get('role') == 'user'),
+            None,
+        )
+        if last_user_msg:
+            phi_types = detect_phi_backend(last_user_msg, language=language)
+            if phi_types:
+                phi_warning = True
+                logger.warning(f"PHI detected in user message: {phi_types}")
 
-        response = ask_rag_question(rag_agent,messages)
-        assistant_message = response.content
+    # ── SSE helpers ───────────────────────────────────────────────────────────
+    _sse_headers = {
+        "Cache-Control":    "no-cache",
+        "X-Accel-Buffering": "no",   # disable nginx buffering when behind a proxy
+    }
 
-        return jsonify({
-            "success": True,
-            "message": assistant_message,
-            # "usage": {
-            #     "prompt_tokens": response.usage.prompt_tokens,
-            #     "completion_tokens": response.usage.completion_tokens,
-            #     "total_tokens": response.usage.total_tokens
-            # }
-            "usage": {
-                "prompt_tokens": response.response_metadata['token_usage']['prompt_tokens'],
-                "completion_tokens": response.response_metadata['token_usage']['completion_tokens'],
-                "total_tokens": response.response_metadata['token_usage']['total_tokens']
-            },
-            "rag_used": True,
-            "phi_warning": False,
-            "phi_types": []
-        }), 200
-        
-    except Exception as e:
-        return jsonify({
-            "error": str(e),
-            "success": False
-        }), 500
+    if phi_warning:
+        # Return the PHI warning as a single SSE event — no LLM call needed.
+        def _phi_gen():
+            event = json.dumps({
+                "type":        "phi_warning",
+                "message": (
+                    "It looks like your message may contain personal information. "
+                    "For your privacy, please remove any personal details (such as "
+                    "names, phone numbers, addresses, or dates of birth) and try again."
+                ),
+                "phi_warning": True,
+                "phi_types":   phi_types,
+            })
+            yield f"data: {event}\n\n"
+
+        return Response(
+            stream_with_context(_phi_gen()),
+            mimetype="text/event-stream",
+            headers=_sse_headers,
+        )
+
+    # ── Normal path: stream the RAG response token-by-token ──────────────────
+    def _rag_gen():
+        try:
+            full_response = ""
+            for token in ask_rag_question_stream(_rag_pipeline, messages):
+                full_response += token
+                yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+
+            # Final event carries the complete assembled text so the frontend
+            # can add it to chat history without re-concatenating.
+            yield f"data: {json.dumps({'type': 'done', 'message': full_response, 'rag_used': True, 'phi_warning': False, 'phi_types': []})}\n\n"
+
+        except Exception as exc:
+            logger.error(f"/api/chat stream error: {exc}")
+            yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
+
+    return Response(
+        stream_with_context(_rag_gen()),
+        mimetype="text/event-stream",
+        headers=_sse_headers,
+    )
     
 @app.route('/api/tts', methods=['POST', 'OPTIONS'])
 def text_to_speech():
     """
-    Text-to-Speech endpoint using OpenAI TTS API
+    Streaming Text-to-Speech endpoint using OpenAI TTS API.
 
     Request body:
-    {
-        "text": "Text to convert to speech",
-        "language": "en" or "es",
-        "voice": "alloy", "echo", "fable", "onyx", "nova", or "shimmer"
-    }
+        { "text": "...", "language": "en"|"es", "voice": "nova", "speed": 0.8 }
 
-    Returns:
-        Audio MP3 blob with proper CORS headers
+    Returns an audio/mpeg stream so the browser can begin playback before the
+    full audio has been generated (using MediaSource Extensions on the client).
     """
     # Handle OPTIONS request for CORS preflight
     if request.method == 'OPTIONS':
@@ -673,60 +650,49 @@ def text_to_speech():
     try:
         data = request.get_json()
 
-        # Validate required fields
         if not data or 'text' not in data:
             return jsonify({'error': 'Missing text in request'}), 400
 
         text = data.get('text', '').strip()
-        language = data.get('language', 'en')  # 'en' or 'es'
-        voice = data.get('voice', 'nova')  # Default voice
-        speed = data.get('speed', 0.7)  # Default speed
+        language = data.get('language', 'en')
+        voice    = data.get('voice', 'nova')
+        speed    = data.get('speed', 0.8)
 
-        # Validate text is not empty
         if not text:
             return jsonify({'error': 'Text cannot be empty'}), 400
 
-        # Limit text length to avoid API errors (max 4096 chars)
+        # OpenAI TTS maximum input length is 4 096 characters
         if len(text) > 4096:
             text = text[:4096]
 
-        # Validate voice option (OpenAI supports: alloy, echo, fable, onyx, nova, shimmer)
         valid_voices = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer']
         if voice not in valid_voices:
-            voice = 'echo' if language == 'en' else 'onyx'
+            voice = 'nova'
 
-        print(f"[TTS] Generating: text='{text[:50]}...', language={language}, voice={voice}")
+        print(f"[TTS] Streaming: text='{text[:50]}...', lang={language}, voice={voice}, speed={speed}")
 
-        # Call OpenAI TTS API
-        response = client.audio.speech.create(
-            model=TTS_MODEL,
-            voice=voice,
-            input=text,
-            response_format='mp3',
-            speed=speed
-        )
+        def _audio_chunks():
+            # with_streaming_response keeps the HTTP connection open and lets us
+            # iterate the raw binary body in chunks as OpenAI produces them.
+            with client.audio.speech.with_streaming_response.create(
+                model=TTS_MODEL,
+                voice=voice,
+                input=text,
+                response_format='mp3',
+                speed=speed,
+            ) as tts_stream:
+                for chunk in tts_stream.iter_bytes(chunk_size=4096):
+                    yield chunk
 
-        # Get audio bytes
-        audio_bytes = io.BytesIO(response.content)
-        audio_bytes.seek(0)
-
-        print(f"[TTS] Successfully generated audio ({len(response.content)} bytes)")
-
-        # Create response with proper headers
-        response_obj = make_response(send_file(
-            audio_bytes,
+        return Response(
+            stream_with_context(_audio_chunks()),
             mimetype='audio/mpeg',
-            as_attachment=False,
-            download_name='speech.mp3'
-        ))
-
-        # Ensure CORS headers are set
-        response_obj.headers['Access-Control-Allow-Origin'] = '*'
-        response_obj.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        response_obj.headers['Content-Type'] = 'audio/mpeg'
-        response_obj.headers['Cache-Control'] = 'no-cache'
-
-        return response_obj
+            headers={
+                'Cache-Control':             'no-cache',
+                'X-Accel-Buffering':         'no',
+                'Access-Control-Allow-Origin': '*',
+            },
+        )
 
     except Exception as e:
         print(f"[TTS] Error: {str(e)}")
