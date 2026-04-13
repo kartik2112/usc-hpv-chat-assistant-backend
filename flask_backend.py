@@ -175,16 +175,42 @@ def daily_task():
 # presidio_analyzer + spaCy's en_core_web_md model consumes ~300 MB of RAM,
 # which exhausts the 512 MB limit on Render's free tier and causes OOM crashes.
 if PHI_ENABLED:
+    import spacy
     from presidio_analyzer import AnalyzerEngine
     from presidio_analyzer.nlp_engine import NlpEngineProvider
+
+    # Always load the English model.
+    _phi_models = [{"lang_code": "en", "model_name": "en_core_web_md"}]
+    _phi_supported_languages = ["en"]
+
+    # Attempt to load the Spanish model.  If it is not installed the engine
+    # degrades gracefully: Spanish text falls back to the English model (still
+    # catches numeric / format-based PHI such as SSNs, phones, and e-mails).
+    # To install the model run:  python -m spacy download es_core_news_md
+    try:
+        spacy.load("es_core_news_md")
+        _phi_models.append({"lang_code": "es", "model_name": "es_core_news_md"})
+        _phi_supported_languages.append("es")
+        logger.info("Spanish spaCy model (es_core_news_md) loaded — bilingual PHI detection enabled")
+    except OSError:
+        logger.warning(
+            "Spanish spaCy model (es_core_news_md) not found. "
+            "Spanish PHI detection will fall back to the English model. "
+            "Run:  python -m spacy download es_core_news_md"
+        )
+
     _nlp_engine = NlpEngineProvider(nlp_configuration={
         "nlp_engine_name": "spacy",
-        "models": [{"lang_code": "en", "model_name": "en_core_web_md"}],
+        "models": _phi_models,
     }).create_engine()
-    pii_analysis_service = AnalyzerEngine(nlp_engine=_nlp_engine)
-    logger.info("PHI detection engine loaded (sackend deployment — PHI_ENABLED=True)")
+    pii_analysis_service = AnalyzerEngine(
+        nlp_engine=_nlp_engine,
+        supported_languages=_phi_supported_languages,
+    )
+    logger.info(f"PHI detection engine loaded (languages: {_phi_supported_languages})")
 else:
     pii_analysis_service = None
+    _phi_supported_languages = []
     logger.info("PHI detection disabled (Render deployment — PHI_ENABLED=False, saving ~300 MB RAM)")
 
 # ---------------------------------------------------------------------------
@@ -216,7 +242,7 @@ HIPAA_PHI_ENTITIES = [
 PHI_SCORE_THRESHOLD = 0.80
 
 
-def detect_phi_backend(text):
+def detect_phi_backend(text, language="en"):
     """Detect HIPAA-relevant PHI in text using Presidio + spaCy (local only).
 
     Returns an empty list immediately when PHI_ENABLED is False (Render
@@ -227,15 +253,25 @@ def detect_phi_backend(text):
     HIPAA_PHI_ENTITIES are checked, and only detections above
     PHI_SCORE_THRESHOLD are reported — this prevents medical acronyms like
     'HPV' from triggering false positives.
+
+    Args:
+        text:     The user message to scan.
+        language: BCP-47 language code sent by the client ("en" or "es").
+                  Falls back to "en" if the requested language model is not
+                  installed.
     """
     if not PHI_ENABLED:
         return []
+
+    # Use the requested language only when its model was successfully loaded;
+    # otherwise degrade gracefully to English.
+    lang = language if language in _phi_supported_languages else "en"
 
     detections = set()
 
     results = pii_analysis_service.analyze(
         text=text,
-        language="en",
+        language=lang,
         entities=HIPAA_PHI_ENTITIES,
         score_threshold=PHI_SCORE_THRESHOLD,
     )
@@ -243,8 +279,9 @@ def detect_phi_backend(text):
         detections.add(result.entity_type)
 
     # Medical Record Numbers — custom regex not covered by Presidio's built-ins.
-    # Matches patterns like "MRN: 12345678" or "MR# 9876".
-    if re.search(r'\b(?:MRN|mrn|MR#|mr#)[\s:]*\d{4,12}\b', text):
+    # English: "MRN: 12345678" or "MR# 9876"
+    # Spanish: "NHC: 12345678" (Número de Historia Clínica)
+    if re.search(r'\b(?:MRN|mrn|MR#|mr#|NHC|nhc)[\s:]*\d{4,12}\b', text):
         detections.add('MEDICAL_RECORD_NUMBER')
 
     return list(detections)
@@ -541,6 +578,10 @@ def chat():
         messages = data.get("messages", [])
         # temperature = data.get("temperature", 0.7)
 
+        # Language sent by the client ("en" or "es"). Used to select the
+        # correct spaCy model inside detect_phi_backend().
+        language = data.get("language", "en")
+
         # Detect PHI/PII in the latest user message (local only, no external calls)
         phi_warning = False
         phi_types = []
@@ -550,7 +591,7 @@ def chat():
                 None
             )
             if last_user_msg:
-                phi_types = detect_phi_backend(last_user_msg)
+                phi_types = detect_phi_backend(last_user_msg, language=language)
                 if phi_types:
                     phi_warning = True
                     logger.warning(f"PHI detected in user message: {phi_types}")
