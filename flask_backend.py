@@ -206,7 +206,6 @@ HIPAA_PHI_ENTITIES = [
     "US_PASSPORT",        # Passport numbers
     "MEDICAL_LICENSE",    # Medical licence / DEA numbers
     "IP_ADDRESS",         # Device IP addresses
-    "DATE_TIME",          # Dates of birth, appointment dates
 ]
 
 # Raise the minimum confidence score above Presidio's default of 0.5.
