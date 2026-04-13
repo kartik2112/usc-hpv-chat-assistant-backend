@@ -905,6 +905,13 @@ def session_log():
         sessions[session_id]['last_activity'] = datetime.utcnow()
         if event:
             sessions[session_id]['events'].append(event)
+            # Re-sort after every insert so that fire-and-forget HTTP requests
+            # that arrive out of order don't corrupt the event sequence.
+            # Primary key: ISO-8601 timestamp (lexicographic == chronological).
+            # Tiebreaker: client-assigned seq counter (monotonic within a session).
+            sessions[session_id]['events'].sort(
+                key=lambda e: (e.get('timestamp', ''), e.get('seq', 0))
+            )
         if messages is not None:
             sessions[session_id]['messages'] = messages
     return jsonify({'status': 'ok'}), 200
