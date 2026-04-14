@@ -428,15 +428,50 @@ def generate_session_summary(messages):
         return {"patient_questions": "Summary unavailable.", "action_items": ""}
 
 
+def _reconstruct_messages_from_events(events):
+    """Build a conversation messages list from event records.
+
+    Used as a fallback in save_session_to_disk when the messages array is
+    empty — e.g. the session expired mid-conversation before any sync landed.
+    Only conversation-type events are included; system/analytics events are
+    skipped so the conversation tab stays in sync with what the events tab shows.
+    """
+    _ROLE_MAP = {
+        'User Text Query':          'user',
+        'User Voice Query':         'user',
+        'Assistant Text Response':  'assistant',
+        'Assistant Voice Response': 'assistant',
+    }
+    messages = []
+    for evt in events:
+        role = _ROLE_MAP.get(evt.get('type', ''))
+        if role and evt.get('details', '').strip():
+            messages.append({'role': role, 'content': evt['details']})
+    return messages
+
+
 def save_session_to_disk(session_id, session_data, summary):
     """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     ended_at  = datetime.utcnow()
     created_at = session_data["created_at"]
 
+    # Use the synced messages array; fall back to reconstructing from events if
+    # it is empty (can happen when a session expires mid-conversation before any
+    # syncMessagesToSession() call reached the server).  This guarantees the
+    # conversation tab and the events tab are never out of sync.
+    raw_messages = session_data.get("messages", [])
+    if not raw_messages:
+        raw_messages = _reconstruct_messages_from_events(session_data.get("events", []))
+        if raw_messages:
+            logger.info(
+                f"Session {session_id}: messages reconstructed from events "
+                f"({len(raw_messages)} entries)"
+            )
+
     # Strip PHI-flagged messages before writing to disk (defence-in-depth).
     clean_messages = [
-        m for m in session_data.get("messages", [])
+        m for m in raw_messages
         if not detect_phi_backend(m.get("content", ""))
     ]
 
@@ -532,7 +567,11 @@ def auto_expire_sessions():
         with sessions_lock:
             session_data = sessions.pop(sid, None)
         if session_data:
-            summary = generate_session_summary(session_data.get("messages", []))
+            # Use synced messages; fall back to event reconstruction if the session
+            # expired before any syncMessagesToSession() call completed.
+            messages = session_data.get("messages", []) or \
+                       _reconstruct_messages_from_events(session_data.get("events", []))
+            summary = generate_session_summary(messages)
             save_session_to_disk(sid, session_data, summary)
             logger.info(f"Auto-expired session {sid}")
 
@@ -908,16 +947,25 @@ def session_end():
     if final_messages is not None:
         session_data['messages'] = final_messages
 
+    # Use the final synced messages; fall back to event reconstruction so a
+    # session is never incorrectly discarded when the messages array is empty
+    # but the events tab has conversation content.
+    effective_messages = session_data.get('messages', []) or \
+                         _reconstruct_messages_from_events(session_data.get('events', []))
+
     # Skip persisting sessions that have no actual conversation content
     user_messages = [
-        m for m in session_data.get('messages', [])
+        m for m in effective_messages
         if m.get('role') == 'user' and m.get('content', '').strip()
     ]
     if not user_messages:
         logger.info(f"Session {session_id} ended with no user messages — not saving.")
         return jsonify({'status': 'skipped', 'reason': 'no_messages'}), 200
 
-    summary = generate_session_summary(session_data.get('messages', []))
+    # Ensure session_data carries the effective messages so save_session_to_disk
+    # and generate_session_summary both see the same complete conversation.
+    session_data['messages'] = effective_messages
+    summary = generate_session_summary(effective_messages)
     filename = save_session_to_disk(session_id, session_data, summary)
     logger.info(f"Session {session_id} ended and saved.")
     return jsonify({'status': 'saved', 'file': os.path.basename(filename), 'summary': summary}), 200
@@ -985,8 +1033,10 @@ def list_sessions():
             fpath = os.path.join(SESSIONS_DIR, fname)
             with open(fpath, 'r') as fp:
                 data = json.load(fp)
-            # Count only the human (user) messages for conciseness
-            messages = data.get('messages', [])
+            # Backward-compat: fall back to event reconstruction for old files
+            # that were saved with an empty messages array.
+            messages = data.get('messages', []) or \
+                       _reconstruct_messages_from_events(data.get('events', []))
             user_turns = sum(1 for m in messages if m.get('role') == 'user')
             created_at_pst = to_pst(data.get('created_at', ''))
             result.append({
@@ -1027,6 +1077,16 @@ def get_session_detail(filename):
     try:
         with open(fpath, 'r') as fp:
             data = json.load(fp)
+
+        # Backward-compat: session files saved before the message-sync fix
+        # may have an empty (or missing) messages array even though the events
+        # array contains full conversation content.  Reconstruct on the fly so
+        # the conversation tab always matches the events tab for old files too.
+        if not data.get('messages'):
+            data['messages'] = _reconstruct_messages_from_events(
+                data.get('events', [])
+            )
+
         # Convert stored UTC timestamps to PST before returning
         data['created_at'] = to_pst(data.get('created_at'))
         data['ended_at']   = to_pst(data.get('ended_at'))
