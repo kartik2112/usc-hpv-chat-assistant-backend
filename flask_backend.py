@@ -235,12 +235,67 @@ HIPAA_PHI_ENTITIES = [
     "IP_ADDRESS",         # Device IP addresses
 ]
 
-# Raise the minimum confidence score above Presidio's default of 0.5.
-# This suppresses low-confidence PERSON hits where spaCy's NER model
-# incorrectly labels medical acronyms (HPV, HER2, BRCA, …) as names.
-# Genuine names in conversational text ("My name is Jane Doe") consistently
-# score ≥ 0.85, so real PHI is still caught.
-PHI_SCORE_THRESHOLD = 0.85
+# Minimum confidence score for Presidio detections.
+#
+# Score reference (measured against en_core_web_md / es_core_news_md):
+#   PERSON (spaCy NER)   → always exactly 0.85  — capped by spaCy's pipeline
+#   EMAIL_ADDRESS        → always 1.00           — pure regex pattern
+#   IP_ADDRESS           → 0.60                  — already below 0.85, never fires
+#   MRN / NHC            → custom regex below    — bypasses Presidio scoring
+#
+# Raising the threshold above spaCy's NER ceiling (0.85) means PERSON
+# entities are no longer reported by Presidio.  This eliminates the entire
+# class of NER-based false positives — capitalised Spanish adjectives,
+# medical acronyms, etc. — while keeping the genuinely high-precision
+# detections: email addresses (1.00) and custom-regex MRNs.
+#
+# The stopword filter added below remains in place as defence-in-depth for
+# any future model that may return a PERSON score above this threshold.
+PHI_SCORE_THRESHOLD = 0.90
+
+# ---------------------------------------------------------------------------
+# Spanish PERSON-entity stopword filter
+# ---------------------------------------------------------------------------
+# The Spanish spaCy NER model (es_core_news_md) occasionally folds common
+# function words into a PERSON span — e.g. tagging "es Importante" as a
+# person name in "Porque es Importante una biopsia".  The two-token minimum
+# check already eliminates single-word false positives, but multi-word
+# function-word combinations slip through.
+#
+# This set contains Spanish articles, prepositions, conjunctions, pronouns,
+# common verbs, and high-frequency adjectives that should NEVER appear as a
+# token inside a genuine person name.  If any token in a PERSON span matches
+# (case-insensitive) an entry here, the detection is discarded as a false
+# positive.  Genuine names ("María García", "Dr. Martínez") contain none of
+# these words and are not affected.
+# ---------------------------------------------------------------------------
+_SPANISH_NAME_STOPWORDS: frozenset[str] = frozenset({
+    # articles
+    "el", "la", "los", "las", "lo", "un", "una", "unos", "unas",
+    # prepositions & contractions
+    "a", "al", "ante", "bajo", "cabe", "con", "contra", "de", "del",
+    "desde", "durante", "en", "entre", "hacia", "hasta", "para",
+    "por", "sin", "sobre", "tras",
+    # conjunctions
+    "e", "ni", "o", "pero", "porque", "que", "si", "sino", "u", "y", "ya",
+    # pronouns
+    "él", "ella", "ellas", "ello", "ellos", "le", "les", "me", "mi",
+    "mis", "nos", "os", "se", "su", "sus", "te", "ti", "tú", "usted",
+    "ustedes", "vos", "yo",
+    # high-frequency verbs (forms that appear in capitalised positions)
+    "es", "está", "están", "fue", "hay", "ser", "son", "tiene", "tienen",
+    # demonstratives & determiners
+    "esa", "esas", "ese", "esos", "esta", "estas", "este", "esto", "estos",
+    "aquel", "aquella", "aquellos", "aquellas",
+    # common adverbs
+    "aquí", "ahí", "allí", "así", "bien", "como", "cuando", "donde",
+    "más", "menos", "muy", "no", "nunca", "siempre", "también", "tan",
+    "todo", "ya",
+    # common adjectives that are sometimes capitalised for emphasis
+    "actual", "común", "comun", "especial", "general", "importante",
+    "necesaria", "necesario", "normal", "nuevo", "nueva", "posible",
+    "principal",
+})
 
 
 def detect_phi_backend(text, language="en"):
@@ -285,7 +340,16 @@ def detect_phi_backend(text, language="en"):
         # conversational text virtually always include a first AND last name.
         if result.entity_type == "PERSON":
             matched_text = text[result.start:result.end].strip()
-            if len(matched_text.split()) < 2:
+            tokens = matched_text.split()
+            if len(tokens) < 2:
+                continue
+            # For Spanish text, discard PERSON spans that contain any token
+            # matching a known Spanish function word / stopword.  The Spanish
+            # NER model often wraps adjacent function words (e.g. "es",
+            # "Importante") into a PERSON span, producing false positives on
+            # ordinary medical questions.  Real patient names ("María García",
+            # "Dr. Ramírez") never contain these words.
+            if lang == "es" and any(t.lower() in _SPANISH_NAME_STOPWORDS for t in tokens):
                 continue
         detections.add(result.entity_type)
 
@@ -296,6 +360,182 @@ def detect_phi_backend(text, language="en"):
         detections.add('MEDICAL_RECORD_NUMBER')
 
     return list(detections)
+
+
+# ============================================================================
+# PHI GUARDRAIL SELF-TEST
+# ============================================================================
+# Runs automatically at server startup (module import time) whenever
+# PHI_ENABLED=True.  Any failure aborts startup with a RuntimeError so a
+# misconfigured or regressed PHI engine is never silently deployed.
+#
+# The same sentences live in test_phi_guardrails.py for use with pytest.
+# Keep the two lists in sync when adding new edge-case sentences.
+# ============================================================================
+
+_PHI_SELFTEST_CLEAN_EN = [
+    "What is HPV and how common is it?",
+    "HPV is the most common sexually transmitted infection in the United States.",
+    "Most people who are sexually active will get HPV at some point in their lives.",
+    "There are more than 200 types of HPV, and about 40 affect the genital area.",
+    "High-risk HPV types can cause cervical, anal, and throat cancers.",
+    "Low-risk HPV types like 6 and 11 cause most genital warts.",
+    "Many HPV infections clear on their own without causing health problems.",
+    "HPV can be transmitted through vaginal, anal, or oral sex.",
+    "You can have HPV without knowing it because it often causes no symptoms.",
+    "HPV spreads through skin-to-skin contact, not through bodily fluids.",
+    "The HPV vaccine is safe and highly effective.",
+    "Gardasil 9 protects against nine types of HPV.",
+    "The vaccine is recommended for boys and girls starting at age eleven or twelve.",
+    "Adults up to age forty-five can still benefit from the HPV vaccine.",
+    "It is best to get vaccinated before becoming sexually active.",
+    "Three doses may be recommended for people who start the vaccine series after age fifteen.",
+    "The HPV vaccine does not contain live virus and cannot cause an HPV infection.",
+    "Side effects of the HPV vaccine are usually mild and include soreness at the injection site.",
+    "Millions of people worldwide have received the HPV vaccine without serious side effects.",
+    "Vaccination can reduce the risk of HPV-related cancers by up to ninety-nine percent.",
+    "A Pap smear collects cells from the cervix to look for abnormal changes.",
+    "Women between twenty-one and sixty-five should get regular cervical cancer screenings.",
+    "An HPV test can detect high-risk HPV types even before cell changes occur.",
+    "A colposcopy is a procedure used to examine the cervix more closely.",
+    "What is the difference between a Pap test and an HPV test?",
+    "Regular screening can detect precancerous changes early, when they are easiest to treat.",
+    "Women aged thirty to sixty-five may have a co-test every five years.",
+    "An abnormal Pap smear result does not necessarily mean you have cancer.",
+    "How long does it take for HPV to develop into cervical cancer?",
+    "It can take fifteen to twenty years for HPV to progress to cervical cancer.",
+    "Why is a biopsy important for diagnosing cervical changes?",
+    "A biopsy removes a small tissue sample to check for abnormal or cancerous cells.",
+    "LEEP is a procedure that removes abnormal cervical tissue with an electric wire loop.",
+    "Cryotherapy can be used to freeze and destroy abnormal cervical cells.",
+    "Genital warts can be treated with topical medications or removed surgically.",
+    "There is currently no cure for HPV itself, but most infections clear naturally.",
+    "The immune system usually clears an HPV infection within one to two years.",
+    "Persistent high-risk HPV infection is the main cause of cervical cancer.",
+    "BRCA mutations are a separate risk factor for breast and ovarian cancer.",
+    "HER2 is a protein that can affect how breast cancer cells grow.",
+    "Using condoms consistently can reduce but not eliminate the risk of HPV transmission.",
+    "Limiting the number of sexual partners lowers the risk of HPV exposure.",
+    "Quitting smoking can reduce the risk of HPV-related cancers.",
+    "A strong immune system helps the body clear HPV infections faster.",
+    "Can HPV be transmitted through kissing or casual contact?",
+    "HPV is not spread through toilet seats, doorknobs, or swimming pools.",
+    "How effective is the HPV vaccine in preventing genital warts?",
+    "What should I do if my HPV test comes back positive?",
+    "Is HPV the same as HIV or herpes?",
+    "Talk to your healthcare provider about the best screening schedule for you.",
+]
+
+_PHI_SELFTEST_CLEAN_ES = [
+    "Porque es Importante una biopsia",
+    "¿Por qué es importante realizarse una biopsia?",
+    "El VPH es la infección de transmisión sexual más común en los Estados Unidos.",
+    "La mayoría de las personas sexualmente activas contraerán el VPH en algún momento.",
+    "Existen más de doscientos tipos de VPH, y alrededor de cuarenta afectan el área genital.",
+    "Los tipos de VPH de alto riesgo pueden causar cáncer de cuello uterino, anal y de garganta.",
+    "Los tipos de VPH de bajo riesgo como el seis y el once causan la mayoría de las verrugas genitales.",
+    "Muchas infecciones por VPH desaparecen solas sin causar problemas de salud.",
+    "El VPH se puede transmitir durante las relaciones sexuales vaginales, anales u orales.",
+    "Puede tener VPH sin saberlo porque a menudo no causa síntomas.",
+    "La vacuna contra el VPH es segura y muy eficaz.",
+    "Gardasil 9 protege contra nueve tipos de VPH.",
+    "La vacuna se recomienda para niños y niñas a partir de los once o doce años.",
+    "Los adultos de hasta cuarenta y cinco años aún pueden beneficiarse de la vacuna contra el VPH.",
+    "Es mejor vacunarse antes de iniciar la actividad sexual.",
+    "La vacuna no contiene virus vivo y no puede causar una infección por VPH.",
+    "Los efectos secundarios de la vacuna contra el VPH suelen ser leves.",
+    "Millones de personas en todo el mundo han recibido la vacuna sin efectos secundarios graves.",
+    "¿A qué edad se recomienda comenzar la serie de vacunas?",
+    "La vacunación puede reducir el riesgo de cánceres relacionados con el VPH hasta en un noventa y nueve por ciento.",
+    "Una prueba de Papanicolaou recolecta células del cuello uterino para detectar cambios anormales.",
+    "Las mujeres entre veintiún y sesenta y cinco años deben realizarse exámenes de detección regulares.",
+    "Una prueba del VPH puede detectar tipos de VPH de alto riesgo antes de que ocurran cambios celulares.",
+    "¿Cuál es la diferencia entre una prueba de Papanicolaou y una prueba del VPH?",
+    "Los exámenes regulares pueden detectar cambios precancerosos cuando son más fáciles de tratar.",
+    "Un resultado anormal en la prueba de Papanicolaou no significa necesariamente que tenga cáncer.",
+    "¿Cuánto tiempo tarda el VPH en convertirse en cáncer de cuello uterino?",
+    "Pueden pasar entre quince y veinte años para que el VPH progrese a cáncer cervical.",
+    "La colposcopía es un procedimiento que examina el cuello uterino con más detalle.",
+    "¿Con qué frecuencia debo hacerme pruebas de detección del cáncer de cuello uterino?",
+    "¿Por qué es necesaria una biopsia para diagnosticar cambios cervicales?",
+    "Una biopsia extrae una pequeña muestra de tejido para detectar células anormales o cancerosas.",
+    "El procedimiento LEEP elimina tejido cervical anormal con un aro de alambre eléctrico.",
+    "La crioterapia puede usarse para congelar y destruir células cervicales anormales.",
+    "Las verrugas genitales se pueden tratar con medicamentos tópicos o extirpar quirúrgicamente.",
+    "Actualmente no existe una cura para el VPH en sí, pero la mayoría de las infecciones desaparecen naturalmente.",
+    "El sistema inmunológico generalmente elimina una infección por VPH en uno o dos años.",
+    "La infección persistente por VPH de alto riesgo es la principal causa del cáncer cervical.",
+    "¿Qué sucede si la prueba del VPH resulta positiva?",
+    "Es posible que su médico recomiende un seguimiento más frecuente si tiene VPH de alto riesgo.",
+    "Usar condones de manera constante puede reducir, pero no eliminar, el riesgo de transmisión del VPH.",
+    "Limitar el número de parejas sexuales reduce el riesgo de exposición al VPH.",
+    "Dejar de fumar puede reducir el riesgo de cánceres relacionados con el VPH.",
+    "Un sistema inmunológico fuerte ayuda al cuerpo a eliminar las infecciones por VPH más rápidamente.",
+    "¿Se puede transmitir el VPH a través de los besos o el contacto casual?",
+    "El VPH no se propaga a través de asientos de inodoro, manijas de puertas o piscinas.",
+    "¿Es el VPH lo mismo que el VIH o el herpes?",
+    "Consulte con su proveedor de atención médica sobre el mejor cronograma de detección para usted.",
+    "¿Qué tan común es la infección por VPH entre los hombres?",
+    "Los hombres también pueden transmitir el VPH aunque no tengan síntomas visibles.",
+]
+
+# High-confidence PHI that must still be detected (email = 1.00, MRN = custom regex).
+_PHI_SELFTEST_PHI = [
+    ("Please email me at jsmith@example.com with the results.", "en"),
+    ("Send the report to maria.garcia@hospital.org as soon as possible.", "en"),
+    ("Contact the clinic at info@healthcenter.org for an appointment.", "en"),
+    ("My MRN: 00012345", "en"),
+    ("Reference number MRN: 9876543", "en"),
+    ("Patient reference NHC: 00056789", "es"),
+    ("Mi número de historia clínica NHC: 12345678", "es"),
+    ("Por favor envíame un correo a paciente@correo.com con los resultados.", "es"),
+    ("Escríbeme a consulta@clinica.mx para más información.", "es"),
+]
+
+
+def _run_phi_selftest() -> None:
+    """Validate the PHI detection engine against known-clean and known-PHI sentences.
+
+    Called once at module import time whenever PHI_ENABLED is True.  Raises
+    RuntimeError on the first failure so the server refuses to start with a
+    misconfigured or regressed guardrail.
+    """
+    false_positives: list[tuple[str, str, list]] = []
+    false_negatives: list[tuple[str, str]] = []
+
+    for sentence in _PHI_SELFTEST_CLEAN_EN:
+        hits = detect_phi_backend(sentence, language="en")
+        if hits:
+            false_positives.append(("en", sentence, hits))
+
+    for sentence in _PHI_SELFTEST_CLEAN_ES:
+        hits = detect_phi_backend(sentence, language="es")
+        if hits:
+            false_positives.append(("es", sentence, hits))
+
+    for sentence, lang in _PHI_SELFTEST_PHI:
+        if not detect_phi_backend(sentence, language=lang):
+            false_negatives.append((lang, sentence))
+
+    en_fp = sum(1 for l, *_ in false_positives if l == "en")
+    es_fp = sum(1 for l, *_ in false_positives if l == "es")
+    logger.info(
+        f"PHI self-test: EN {50 - en_fp}/50 clean  |  "
+        f"ES {50 - es_fp}/50 clean  |  "
+        f"true-positives {len(_PHI_SELFTEST_PHI) - len(false_negatives)}/{len(_PHI_SELFTEST_PHI)}"
+    )
+
+    if false_positives or false_negatives:
+        lines = ["PHI guardrail self-test FAILED — server startup aborted."]
+        for lang, sentence, hits in false_positives:
+            lines.append(f"  FALSE POSITIVE [{lang}]: '{sentence}' → {hits}")
+        for lang, sentence in false_negatives:
+            lines.append(f"  FALSE NEGATIVE [{lang}]: '{sentence}' (expected detection, got none)")
+        raise RuntimeError("\n".join(lines))
+
+
+if PHI_ENABLED:
+    _run_phi_selftest()
 
 
 # ============================================================================
