@@ -332,24 +332,22 @@ def detect_phi_backend(text, language="en"):
         score_threshold=PHI_SCORE_THRESHOLD,
     )
     for result in results:
-        # For PERSON entities, require the matched span to contain at least two
-        # whitespace-separated tokens (e.g. "Jane Doe", "Dr. García").
-        # Single capitalised words — such as "Importante" in Spanish or medical
-        # abbreviations — are routinely mis-tagged as person names by spaCy's NER
-        # models in both English and Spanish.  Real patient / provider names in
-        # conversational text virtually always include a first AND last name.
         if result.entity_type == "PERSON":
-            matched_text = text[result.start:result.end].strip()
-            tokens = matched_text.split()
-            if len(tokens) < 2:
+            # Spanish PERSON detection is fully disabled.  The es_core_news_md
+            # NER model produces too many false positives on ordinary health-
+            # education sentences (e.g. "Que tan eficaz es la vacuna",
+            # "Porque es Importante una biopsia") even after stopword filtering,
+            # because the model folds common Spanish function words into PERSON
+            # spans at a rate that makes reliable detection impractical.
+            # Email addresses and MRN/NHC regex still catch the most sensitive
+            # identifiers for Spanish-language messages.
+            if lang == "es":
                 continue
-            # For Spanish text, discard PERSON spans that contain any token
-            # matching a known Spanish function word / stopword.  The Spanish
-            # NER model often wraps adjacent function words (e.g. "es",
-            # "Importante") into a PERSON span, producing false positives on
-            # ordinary medical questions.  Real patient names ("María García",
-            # "Dr. Ramírez") never contain these words.
-            if lang == "es" and any(t.lower() in _SPANISH_NAME_STOPWORDS for t in tokens):
+            # For English PERSON entities, require at least two whitespace-
+            # separated tokens (e.g. "Jane Doe").  Single capitalised words and
+            # medical acronyms are routinely mis-tagged as names by spaCy NER.
+            matched_text = text[result.start:result.end].strip()
+            if len(matched_text.split()) < 2:
                 continue
         detections.add(result.entity_type)
 
@@ -428,6 +426,7 @@ _PHI_SELFTEST_CLEAN_EN = [
 
 _PHI_SELFTEST_CLEAN_ES = [
     "Porque es Importante una biopsia",
+    "Que tan eficaz es la vacuna",
     "¿Por qué es importante realizarse una biopsia?",
     "El VPH es la infección de transmisión sexual más común en los Estados Unidos.",
     "La mayoría de las personas sexualmente activas contraerán el VPH en algún momento.",
@@ -481,15 +480,22 @@ _PHI_SELFTEST_CLEAN_ES = [
 
 # High-confidence PHI that must still be detected (email = 1.00, MRN = custom regex).
 _PHI_SELFTEST_PHI = [
+    # EMAIL_ADDRESS — pattern-based (score 1.00), caught in both languages
     ("Please email me at jsmith@example.com with the results.", "en"),
     ("Send the report to maria.garcia@hospital.org as soon as possible.", "en"),
     ("Contact the clinic at info@healthcenter.org for an appointment.", "en"),
+    ("Por favor envíame un correo a paciente@correo.com con los resultados.", "es"),
+    ("Escríbeme a consulta@clinica.mx para más información.", "es"),
+    # MEDICAL_RECORD_NUMBER — custom regex, threshold-independent
     ("My MRN: 00012345", "en"),
     ("Reference number MRN: 9876543", "en"),
     ("Patient reference NHC: 00056789", "es"),
     ("Mi número de historia clínica NHC: 12345678", "es"),
-    ("Por favor envíame un correo a paciente@correo.com con los resultados.", "es"),
-    ("Escríbeme a consulta@clinica.mx para más información.", "es"),
+    # NOTE: PERSON entities are not included here.  spaCy's NER pipeline
+    # caps PERSON confidence at 0.85, which is below PHI_SCORE_THRESHOLD (0.90),
+    # so PERSON detection is effectively disabled for both languages at this
+    # threshold.  Spanish PERSON is also explicitly skipped in detect_phi_backend
+    # as defence-in-depth against future model updates.
 ]
 
 

@@ -129,8 +129,9 @@ def test_english_no_false_positive(sentence):
 # SPANISH — 50 sentences that must produce zero detections
 # ===========================================================================
 SPANISH_CLEAN_SENTENCES = [
-    # General HPV knowledge — the original failing sentence first
+    # General HPV knowledge — previously failing sentences first
     "Porque es Importante una biopsia",
+    "Que tan eficaz es la vacuna",
     "¿Por qué es importante realizarse una biopsia?",
     "El VPH es la infección de transmisión sexual más común en los Estados Unidos.",
     "La mayoría de las personas sexualmente activas contraerán el VPH en algún momento.",
@@ -217,18 +218,22 @@ def test_spanish_no_false_positive(sentence):
 # genuinely unambiguous detections: email addresses and MRN regex matches.
 # ===========================================================================
 PHI_SENTENCES = [
-    # EMAIL_ADDRESS — pattern-based, scores 1.00, reliably caught
+    # EMAIL_ADDRESS — pattern-based (score 1.00), caught in both languages
     ("Please email me at jsmith@example.com with the results.", "en"),
     ("Send the report to maria.garcia@hospital.org as soon as possible.", "en"),
     ("Contact the clinic at info@healthcenter.org for an appointment.", "en"),
-    # MEDICAL_RECORD_NUMBER — custom regex in detect_phi_backend, threshold-independent
+    ("Por favor envíame un correo a paciente@correo.com con los resultados.", "es"),
+    ("Escríbeme a consulta@clinica.mx para más información.", "es"),
+    # MEDICAL_RECORD_NUMBER — custom regex, threshold-independent
     ("My MRN: 00012345", "en"),
     ("Reference number MRN: 9876543", "en"),
     ("Patient reference NHC: 00056789", "es"),
     ("Mi número de historia clínica NHC: 12345678", "es"),
-    # EMAIL (Spanish context)
-    ("Por favor envíame un correo a paciente@correo.com con los resultados.", "es"),
-    ("Escríbeme a consulta@clinica.mx para más información.", "es"),
+    # NOTE: PERSON entities are not included here.  spaCy's NER pipeline caps
+    # PERSON confidence at 0.85, which sits below PHI_SCORE_THRESHOLD (0.90),
+    # so PERSON detection is effectively disabled for both languages at this
+    # threshold.  Spanish PERSON is also explicitly skipped in detect_phi_backend
+    # as defence-in-depth against future model updates that might score higher.
 ]
 
 
