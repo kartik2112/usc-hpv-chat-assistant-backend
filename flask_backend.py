@@ -336,16 +336,6 @@ def detect_phi_backend(text, language="en"):
     )
     for result in results:
         if result.entity_type == "PERSON":
-            # Spanish PERSON detection is fully disabled.  The es_core_news_md
-            # NER model produces too many false positives on ordinary health-
-            # education sentences (e.g. "Que tan eficaz es la vacuna",
-            # "Porque es Importante una biopsia") even after stopword filtering,
-            # because the model folds common Spanish function words into PERSON
-            # spans at a rate that makes reliable detection impractical.
-            # Email addresses and MRN/NHC regex still catch the most sensitive
-            # identifiers for Spanish-language messages.
-            if lang == "es":
-                continue
             # For English PERSON entities, require at least two whitespace-
             # separated tokens (e.g. "Jane Doe").  Single capitalised words and
             # medical acronyms are routinely mis-tagged as names by spaCy NER.

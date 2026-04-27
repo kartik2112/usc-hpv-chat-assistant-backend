@@ -10,3 +10,4 @@ uv sync
 
 # Download spaCy medium model (~40MB) for Presidio NER
 uv run python -m spacy download en_core_web_md
+uv run python -m spacy download es_core_news_md
