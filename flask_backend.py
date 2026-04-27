@@ -43,6 +43,9 @@ load_dotenv()
 IS_RENDER   = bool(os.getenv("RENDER"))          # True on onrender.com
 PHI_ENABLED = not IS_RENDER                       # False on Render, True on sackend
 
+# Backend version for tracking
+BACKEND_VERSION = "v1"
+
 # Timezone helper — converts UTC ISO strings (as stored in session files) to
 # Pacific Time (America/Los_Angeles handles both PST/UTC-8 and PDT/UTC-7).
 _PACIFIC = ZoneInfo('America/Los_Angeles')
@@ -1090,6 +1093,7 @@ def health():
     """Health check with mode information"""
     return jsonify({
         'status': 'ok',
+        'backend_version': BACKEND_VERSION,
         'audio_mode': AUDIO_MODE.upper(),
         'endpoints': {
             'text_chat': 'ready',
@@ -1100,6 +1104,11 @@ def health():
             'text': OPENAI_TEXT_MODEL,
             'audio': OPENAI_AUDIO_MODEL,
             'tts': TTS_MODEL
+        },
+        'phi_config': {
+            'enabled': PHI_ENABLED,
+            'threshold': PHI_SCORE_THRESHOLD,
+            'languages': _phi_supported_languages if PHI_ENABLED else []
         }
     }), 200
 
