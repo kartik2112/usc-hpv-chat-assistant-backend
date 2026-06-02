@@ -1259,6 +1259,7 @@ def session_start():
         sessions[session_id] = {
             'events': [],
             'messages': [],
+            'last_messages_seq': -1,   # highest messages_seq applied so far (stale-overwrite guard)
             'last_activity': now,
             'created_at': now
         }
@@ -1287,6 +1288,7 @@ def session_log():
     session_id = data.get('session_id')
     event = data.get('event')          # single event object (optional)
     messages = data.get('messages')    # full messages array (optional)
+    messages_seq = data.get('messages_seq')   # client-monotonic counter (optional)
     with sessions_lock:
         if session_id not in sessions:
             return jsonify({'error': 'session_expired'}), 404
@@ -1301,7 +1303,17 @@ def session_log():
                 key=lambda e: (e.get('timestamp', ''), e.get('seq', 0))
             )
         if messages is not None:
-            sessions[session_id]['messages'] = messages
+            # syncMessagesToSession() on the client is fire-and-forget, so an
+            # older (shorter) snapshot can arrive AFTER a newer one and clobber
+            # it — leaving the conversation tab frozen at a partial history while
+            # the events tab (append + re-sort) stays complete. Apply the update
+            # only when its seq is newer than the last one we accepted. Payloads
+            # without a seq (older clients) keep the legacy last-write behaviour.
+            stored_seq = sessions[session_id].get('last_messages_seq', -1)
+            if messages_seq is None or messages_seq > stored_seq:
+                sessions[session_id]['messages'] = messages
+                if messages_seq is not None:
+                    sessions[session_id]['last_messages_seq'] = messages_seq
     return jsonify({'status': 'ok'}), 200
 
 
