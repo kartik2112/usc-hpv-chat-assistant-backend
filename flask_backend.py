@@ -23,7 +23,7 @@ import logging
 import bcrypt
 from flask_apscheduler import APScheduler
 
-from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream
+from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream, retrieve_context_docs
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -1002,17 +1002,41 @@ def chat():
             headers=_sse_headers,
         )
 
+    # ── Retrieve the RAG chunks once, up front ───────────────────────────────
+    # The same docs are (a) fed to the LLM as context and (b) reported back to
+    # the client in the final 'done' event so the session log can record which
+    # references informed each answer. Retrieving here (instead of letting the
+    # stream do it internally) guarantees the recorded references match exactly
+    # what the model saw, without running the similarity search twice.
+    references = []
+    retrieved_docs = []
+    try:
+        retrieved_docs = retrieve_context_docs(_rag_pipeline, messages)
+        references = [
+            {
+                "source": (doc.metadata or {}).get("source", ""),
+                "content": doc.page_content,
+            }
+            for doc in retrieved_docs
+        ]
+    except Exception as exc:
+        # Retrieval failure should not break the chat — fall back to letting the
+        # stream retrieve internally and simply report no references.
+        logger.error(f"/api/chat reference retrieval error: {exc}")
+        retrieved_docs = None
+
     # ── Normal path: stream the RAG response token-by-token ──────────────────
     def _rag_gen():
         try:
             full_response = ""
-            for token in ask_rag_question_stream(_rag_pipeline, messages):
+            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs):
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
             # Final event carries the complete assembled text so the frontend
-            # can add it to chat history without re-concatenating.
-            yield f"data: {json.dumps({'type': 'done', 'message': full_response, 'rag_used': True, 'phi_warning': False, 'phi_types': []})}\n\n"
+            # can add it to chat history without re-concatenating. 'references'
+            # lists the RAG chunks retrieved for this turn (may be empty).
+            yield f"data: {json.dumps({'type': 'done', 'message': full_response, 'rag_used': True, 'phi_warning': False, 'phi_types': [], 'references': references})}\n\n"
 
         except Exception as exc:
             logger.error(f"/api/chat stream error: {exc}")

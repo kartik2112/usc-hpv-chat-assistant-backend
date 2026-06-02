@@ -322,7 +322,30 @@ def ask_rag_question(agent, messages):
 		raise Exception(f"Error generating response: {str(e)}")
 
 
-def ask_rag_question_stream(pipeline, messages):
+def retrieve_context_docs(pipeline, messages):
+	"""Return the documents retrieved for the last user turn.
+
+	Exposes the same retrieval step used internally by
+	ask_rag_question_stream / the _prompt_with_context middleware so callers
+	(e.g. the /api/chat endpoint) can record which RAG chunks informed a
+	given answer without having to run the similarity search a second time.
+
+	Args:
+		pipeline: The HPVRAGPipeline instance returned by build_rag_agent().
+		messages: The conversation messages list (OpenAI dict format).
+
+	Returns:
+		list: LangChain Document objects (each has .page_content and .metadata).
+	"""
+	last_query = ""
+	for m in reversed(messages):
+		if isinstance(m, dict) and m.get("role") == "user":
+			last_query = m.get("content", "")
+			break
+	return pipeline.vector_store.similarity_search(last_query)
+
+
+def ask_rag_question_stream(pipeline, messages, retrieved_docs=None):
 	"""Generator that yields raw text tokens for a streaming RAG response.
 
 	Performs the same retrieval step as the non-streaming path (similarity
@@ -333,19 +356,19 @@ def ask_rag_question_stream(pipeline, messages):
 	Args:
 		pipeline: The HPVRAGPipeline instance returned by build_rag_agent().
 		messages: The conversation messages list (OpenAI dict format).
+		retrieved_docs: Optional pre-retrieved documents (from
+			retrieve_context_docs). When provided, the internal similarity
+			search is skipped so the caller and the LLM see exactly the same
+			chunks without performing the retrieval twice. Falls back to an
+			internal retrieval when None.
 
 	Yields:
 		str: Each text token/chunk from the LLM as it is produced.
 	"""
-	# Extract the last user turn for retrieval
-	last_query = ""
-	for m in reversed(messages):
-		if isinstance(m, dict) and m.get("role") == "user":
-			last_query = m.get("content", "")
-			break
-
 	# Retrieve relevant documents (mirrors _prompt_with_context middleware)
-	retrieved_docs = pipeline.vector_store.similarity_search(last_query)
+	# unless the caller already did so and passed them in.
+	if retrieved_docs is None:
+		retrieved_docs = retrieve_context_docs(pipeline, messages)
 	docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
 	system_message = (
