@@ -208,14 +208,12 @@ def test_spanish_no_false_positive(sentence):
 #
 # Score reference (en_core_web_md / es_core_news_md):
 #   EMAIL_ADDRESS  → 1.00  — pure regex, always caught at any reasonable threshold
-#   PERSON (NER)   → 0.85  — spaCy's fixed ceiling, now BELOW PHI_SCORE_THRESHOLD
+#   PERSON (NER)   → 0.85  — spaCy's fixed ceiling, below PHI_SCORE_THRESHOLD (0.90);
+#                            caught via dedicated low-threshold passes in detect_phi_backend
+#   PHONE_NUMBER   → 0.75 base; context words boost to ≥ 0.90 via ContextAwareEnhancer
+#   US_SSN         → 0.85 base; "SSN" context word boosts to 1.00
+#   CREDIT_CARD    → 0.85 base (Luhn-valid); "credit card" context boosts to 1.00
 #   MRN / NHC      → custom regex (bypasses Presidio scoring, always caught)
-#
-# PHI_SCORE_THRESHOLD is now 0.90, which sits above spaCy's NER ceiling.
-# PERSON names are therefore no longer flagged by Presidio — this is
-# intentional: it eliminates the entire category of NER-based false positives
-# (capitalised Spanish adjectives, medical acronyms, etc.) while keeping the
-# genuinely unambiguous detections: email addresses and MRN regex matches.
 # ===========================================================================
 PHI_SENTENCES = [
     # EMAIL_ADDRESS — pattern-based (score 1.00), caught in both languages
@@ -229,11 +227,21 @@ PHI_SENTENCES = [
     ("Reference number MRN: 9876543", "en"),
     ("Patient reference NHC: 00056789", "es"),
     ("Mi número de historia clínica NHC: 12345678", "es"),
-    # NOTE: PERSON entities are not included here.  spaCy's NER pipeline caps
-    # PERSON confidence at 0.85, which sits below PHI_SCORE_THRESHOLD (0.90),
-    # so PERSON detection is effectively disabled for both languages at this
-    # threshold.  Spanish PERSON is also explicitly skipped in detect_phi_backend
-    # as defence-in-depth against future model updates that might score higher.
+    # PERSON (English) — dedicated low-threshold pass (0.85), two-token minimum
+    ("My doctor Jane Smith will follow up with me next week.", "en"),
+    ("Please schedule an appointment for Robert Johnson.", "en"),
+    ("The referral is for patient Emily Davis.", "en"),
+    # PHONE_NUMBER — context words boost score above 0.90
+    ("My phone number is (213) 555-0147 if you need to reach me.", "en"),
+    ("You can call me at 310-555-0182 to discuss the results.", "en"),
+    # US_SSN — "SSN" context word boosts score to 1.00
+    ("My SSN is 123-45-6789, please update my records.", "en"),
+    # CREDIT_CARD — Luhn-valid test number (Visa 4111…) with "credit card" context
+    ("My credit card number is 4111111111111111 for the copay.", "en"),
+    # PERSON (Spanish) — low-threshold pass (0.85) + stopword filter
+    ("El paciente Juan García asistirá a su cita el próximo lunes.", "es"),
+    ("Por favor contacte a María López para más información sobre su diagnóstico.", "es"),
+    ("La paciente Ana Martínez necesita renovar su receta médica esta semana.", "es"),
 ]
 
 

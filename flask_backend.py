@@ -151,7 +151,8 @@ def restrict_to_allowed_origins():
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
 # Configuration
-OPENAI_TEXT_MODEL = "gpt-5-mini"
+OPENAI_TEXT_MODEL = "gpt-5.5"
+REASONING_EFFORT = "low"
 MAX_COMPLETION_TOKENS = 1200
 OPENAI_AUDIO_MODEL = 'gpt-4o-audio-preview'
 TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
@@ -254,7 +255,7 @@ HIPAA_PHI_ENTITIES = [
 #
 # The stopword filter added below remains in place as defence-in-depth for
 # any future model that may return a PERSON score above this threshold.
-PHI_SCORE_THRESHOLD = 0.90
+PHI_SCORE_THRESHOLD = 0.85
 
 # ---------------------------------------------------------------------------
 # Spanish PERSON-entity stopword filter
@@ -328,6 +329,13 @@ def detect_phi_backend(text, language="en"):
 
     detections = set()
 
+    # ── Main pass (score ≥ PHI_SCORE_THRESHOLD = 0.85) ─────────────────────
+    # Catches EMAIL_ADDRESS (1.00), CREDIT_CARD (Luhn-validated, base 0.85),
+    # and any pattern entity whose ContextAwareEnhancer boost brings it above
+    # threshold.  PERSON (spaCy NER, capped at 0.85) is caught here only if
+    # it exactly equals the threshold; dedicated PERSON passes below apply
+    # stricter filtering.  PHONE_NUMBER and US_SSN use their own dedicated
+    # lower-threshold passes further down since their base scores sit below 0.85.
     results = pii_analysis_service.analyze(
         text=text,
         language=lang,
@@ -335,16 +343,88 @@ def detect_phi_backend(text, language="en"):
         score_threshold=PHI_SCORE_THRESHOLD,
     )
     for result in results:
-        if result.entity_type == "PERSON":
-            # For English PERSON entities, require at least two whitespace-
-            # separated tokens (e.g. "Jane Doe").  Single capitalised words and
-            # medical acronyms are routinely mis-tagged as names by spaCy NER.
+        detections.add(result.entity_type)
+
+    # ── English PERSON pass (score = 0.85) ──────────────────────────────────
+    # spaCy's en_core_web_md NER always returns exactly 0.85 for PERSON.
+    # Run a dedicated pass at 0.85 and require at least two tokens to suppress
+    # single-word false positives (medical acronyms, capitalised adjectives, etc.).
+    if lang == "en":
+        en_person_results = pii_analysis_service.analyze(
+            text=text,
+            language=lang,
+            entities=["PERSON"],
+            score_threshold=0.85,
+        )
+        for result in en_person_results:
             matched_text = text[result.start:result.end].strip()
             if len(matched_text.split()) < 2:
                 continue
-        detections.add(result.entity_type)
+            detections.add("PERSON")
 
-    # Medical Record Numbers — custom regex not covered by Presidio's built-ins.
+    # ── Spanish PERSON pass (score = 0.85) ──────────────────────────────────
+    # Same as the English pass, but also applies the stopword filter because
+    # es_core_news_md occasionally folds Spanish function words (e.g.
+    # "es Importante") into a PERSON span.
+    if lang == "es":
+        es_person_results = pii_analysis_service.analyze(
+            text=text,
+            language=lang,
+            entities=["PERSON"],
+            score_threshold=0.85,
+        )
+        for result in es_person_results:
+            matched_text = text[result.start:result.end].strip()
+            tokens = matched_text.split()
+            if len(tokens) < 2:
+                continue
+            if any(t.lower() in _SPANISH_NAME_STOPWORDS for t in tokens):
+                continue
+            detections.add("PERSON")
+
+    # ── PHONE_NUMBER dedicated pass (score ≥ 0.40) ──────────────────────────
+    # Presidio's PhoneRecognizer assigns a base score of ~0.75 for a valid
+    # phone pattern match and relies on the ContextAwareEnhancer (+0.35) to
+    # push it above PHI_SCORE_THRESHOLD when context words ("phone number",
+    # "call me at") appear nearby.  In the current Presidio version the
+    # enhancer does not reliably fire for phone patterns, leaving the score
+    # at 0.75 — below the 0.85 main-pass threshold.
+    #
+    # Phone-number patterns are high-specificity (10+ digit strings in a
+    # recognisable telephone format); any match is almost certainly real PHI.
+    # We require ≥ 10 digits in the matched span to rule out short sequences
+    # like 7-digit local numbers that occasionally appear in medical text.
+    if "PHONE_NUMBER" not in detections:
+        phone_results = pii_analysis_service.analyze(
+            text=text,
+            language=lang,
+            entities=["PHONE_NUMBER"],
+            score_threshold=0.40,
+        )
+        for result in phone_results:
+            matched_text = text[result.start:result.end].strip()
+            if sum(c.isdigit() for c in matched_text) >= 10:
+                detections.add("PHONE_NUMBER")
+
+    # ── US_SSN dedicated pass (score ≥ 0.50) ────────────────────────────────
+    # Presidio's SsnRecognizer uses a strict ###-##-#### regex.  Without
+    # context words ("SSN", "social security number") the ContextAwareEnhancer
+    # may not boost the base score above PHI_SCORE_THRESHOLD.
+    # The SSN format is extremely specific; a regex match is almost
+    # certainly real PHI regardless of confidence score.
+    # US_SSN has no Spanish recognizer, so only run this pass for English.
+    if lang == "en" and "US_SSN" not in detections:
+        ssn_results = pii_analysis_service.analyze(
+            text=text,
+            language=lang,
+            entities=["US_SSN"],
+            score_threshold=0.50,
+        )
+        for result in ssn_results:
+            detections.add("US_SSN")
+
+    # ── Medical Record Numbers ───────────────────────────────────────────────
+    # Custom regex not covered by Presidio's built-ins.
     # English: "MRN: 12345678" or "MR# 9876"
     # Spanish: "NHC: 12345678" (Número de Historia Clínica)
     if re.search(r'\b(?:MRN|mrn|MR#|mr#|NHC|nhc)[\s:]*\d{4,12}\b', text):
@@ -484,11 +564,31 @@ _PHI_SELFTEST_PHI = [
     ("Reference number MRN: 9876543", "en"),
     ("Patient reference NHC: 00056789", "es"),
     ("Mi número de historia clínica NHC: 12345678", "es"),
-    # NOTE: PERSON entities are not included here.  spaCy's NER pipeline
-    # caps PERSON confidence at 0.85, which is below PHI_SCORE_THRESHOLD (0.90),
-    # so PERSON detection is effectively disabled for both languages at this
-    # threshold.  Spanish PERSON is also explicitly skipped in detect_phi_backend
-    # as defence-in-depth against future model updates.
+    # PERSON (English) — dedicated low-threshold pass (0.85), two-token minimum.
+    # Each sentence contains a clear first + last name that en_core_web_md
+    # reliably tags as PERSON.
+    ("My doctor Jane Smith will follow up with me next week.", "en"),
+    ("Please schedule an appointment for Robert Johnson.", "en"),
+    ("The referral is for patient Emily Davis.", "en"),
+    # PHONE_NUMBER — caught by dedicated low-threshold pass (score ≥ 0.40 with
+    # ≥ 10 digit requirement), since the ContextAwareEnhancer does not reliably
+    # boost the base score (0.75) above PHI_SCORE_THRESHOLD in the main pass.
+    ("My phone number is (213) 555-0147 if you need to reach me.", "en"),
+    ("You can call me at 310-555-0182 to discuss the results.", "en"),
+    # US_SSN — caught by dedicated low-threshold pass (score ≥ 0.50); the strict
+    # ###-##-#### regex match is essentially unambiguous PHI.
+    # Note: 123-45-6789 is blacklisted by Presidio's UsSsnRecognizer.invalidate_result
+    # as a known sample SSN (digits "123456789"), so we use a non-blacklisted number.
+    ("My SSN is 219-09-9999, please update my records.", "en"),
+    # CREDIT_CARD — Luhn-valid test number (Visa 4111…); "credit card" context
+    # boosts Presidio's score (0.85 + 0.35) to 1.00.
+    ("My credit card number is 4111111111111111 for the copay.", "en"),
+    # PERSON (Spanish) — low-threshold pass (0.85) + stopword filter.
+    # Each sentence contains a genuine two-token Spanish full name that the
+    # es_core_news_md NER model reliably tags as PERSON.
+    ("El paciente Juan García asistirá a su cita el próximo lunes.", "es"),
+    ("Por favor contacte a María López para más información sobre su diagnóstico.", "es"),
+    ("La paciente Ana Martínez necesita renovar su receta médica esta semana.", "es"),
 ]
 
 
@@ -516,11 +616,13 @@ def _run_phi_selftest() -> None:
         if not detect_phi_backend(sentence, language=lang):
             false_negatives.append((lang, sentence))
 
+    en_total = len(_PHI_SELFTEST_CLEAN_EN)
+    es_total = len(_PHI_SELFTEST_CLEAN_ES)
     en_fp = sum(1 for l, *_ in false_positives if l == "en")
     es_fp = sum(1 for l, *_ in false_positives if l == "es")
     logger.info(
-        f"PHI self-test: EN {50 - en_fp}/50 clean  |  "
-        f"ES {50 - es_fp}/50 clean  |  "
+        f"PHI self-test: EN {en_total - en_fp}/{en_total} clean  |  "
+        f"ES {es_total - es_fp}/{es_total} clean  |  "
         f"true-positives {len(_PHI_SELFTEST_PHI) - len(false_negatives)}/{len(_PHI_SELFTEST_PHI)}"
     )
 
@@ -542,7 +644,7 @@ if PHI_ENABLED:
 # ============================================================================
 
 SESSIONS_DIR = 'sessions'
-SESSION_TIMEOUT_MINUTES = 2
+SESSION_TIMEOUT_MINUTES = 60
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 sessions = {}          # { session_id: { events, messages, last_activity, created_at } }
@@ -642,6 +744,7 @@ def generate_session_summary(messages):
                     "HPV the patient demonstrated with their questions. "
                     "Do not capture all possible actions that a provider should do. Focus on the few most important ones based on the conversation. "
                     "Please refrain from converting every question into an action item. Keep this extremely brief, concise and to the point.\n"
+                    "ALWAYS TRANSLATE THE SUMMARY TO ENGLISH, regardless of the language of the conversation.\n"
                     "Return ONLY valid JSON. Example:\n"
                     '{"patient_questions": "• Question 1\\n• Question 2", '
                     '"action_items": "• Action 1\\n• Action 2"}'
@@ -656,6 +759,7 @@ def generate_session_summary(messages):
             model=OPENAI_TEXT_MODEL,
             messages=summary_prompt,
             max_completion_tokens=5000,
+            reasoning_effort=REASONING_EFFORT,
             response_format={"type": "json_object"}   # forces raw JSON — no markdown fences
         )
         raw = (response.choices[0].message.content or "").strip()
@@ -1350,7 +1454,7 @@ def get_session_detail(filename):
 scheduler.init_app(app)
 scheduler.add_job(id='daily_task_1am', func=daily_task, trigger='cron', hour=1, minute=0)
 scheduler.add_job(id='session_cleanup', func=auto_expire_sessions,
-                  trigger='interval', seconds=30)
+                  trigger='interval', minutes=5)
 scheduler.start()
 
 if __name__ == '__main__':

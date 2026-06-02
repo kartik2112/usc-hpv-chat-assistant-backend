@@ -29,13 +29,17 @@ USE_CHROMA_CLOUD = True
 
 
 class HPVRAGPipeline:
-	def __init__(self, openai_text_model='gpt-5-mini', persist_directory="chroma_db", max_completion_tokens=1200):
+	def __init__(self, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
 		self.persist_directory = persist_directory
 
 		self.openai_text_model = openai_text_model
 
 		self.embeddings = OpenAIEmbeddings()
-		self.response_llm = ChatOpenAI(model_name=openai_text_model, max_completion_tokens=max_completion_tokens)
+		self.response_llm = ChatOpenAI(
+			model_name=openai_text_model,
+			max_completion_tokens=max_completion_tokens,
+			model_kwargs={"reasoning_effort": "low"},
+		)
 
 
 		
@@ -283,7 +287,7 @@ class HPVRAGPipeline:
 	# 	except Exception as e:
 	# 		raise Exception(f"Error generating response: {str(e)}")
 		
-def build_rag_agent(openai_text_model='gpt-5-mini', persist_directory="chroma_db", max_completion_tokens=1200):
+def build_rag_agent(openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
 	rag_pipeline = HPVRAGPipeline(openai_text_model=openai_text_model, persist_directory=persist_directory, max_completion_tokens=max_completion_tokens)
 	@dynamic_prompt
 	def _prompt_with_context(request: ModelRequest) -> str:
