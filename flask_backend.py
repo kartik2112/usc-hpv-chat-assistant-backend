@@ -153,10 +153,16 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 # Configuration
 OPENAI_TEXT_MODEL = "gpt-5.5"
 REASONING_EFFORT = "low"
-MAX_COMPLETION_TOKENS = 1200
+MAX_COMPLETION_TOKENS = 2048
 OPENAI_AUDIO_MODEL = 'gpt-4o-audio-preview'
 TTS_MODEL = 'tts-1'  # or 'tts-1-hd' for higher quality
 AUDIO_MODE = 'a2a'  # Change to 'tts' or 'a2a' to switch modes
+
+# Prefixed model labels stored once per session in the log file.
+# "openai-" prefix is added to all OpenAI model names so the dashboard and
+# any downstream tooling can identify the model provider unambiguously.
+TEXT_MODEL_LABEL  = f"openai-{OPENAI_TEXT_MODEL}"
+AUDIO_MODEL_LABEL = f"openai-{TTS_MODEL}"
 
 logger.info(f"🎯 Backend Audio Mode: {AUDIO_MODE.upper()}")
 logger.info(f"   TTS Mode = {OPENAI_TEXT_MODEL} + TTS API")
@@ -821,12 +827,14 @@ def save_session_to_disk(session_id, session_data, summary):
     # ── JSON ──────────────────────────────────────────────────────────────────
     json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
     payload = {
-        "session_id": session_id,
-        "created_at": created_at.isoformat(),
-        "ended_at":   ended_at.isoformat(),
-        "events":     session_data.get("events", []),
-        "messages":   clean_messages,
-        "summary":    summary
+        "session_id":  session_id,
+        "created_at":  created_at.isoformat(),
+        "ended_at":    ended_at.isoformat(),
+        "text_model":  TEXT_MODEL_LABEL,
+        "audio_model": AUDIO_MODEL_LABEL,
+        "events":      session_data.get("events", []),
+        "messages":    clean_messages,
+        "summary":     summary
     }
     with open(json_filename, 'w') as f:
         json.dump(payload, f, indent=2)
@@ -1516,5 +1524,8 @@ if __name__ == '__main__':
     print("   ✓ /mode (mode information)")
     print("\n" + "="*80)
 
-    # When running with app.run(), set use_reloader=False to prevent jobs from running twice
-    app.run(use_reloader=False) 
+    # use_reloader=True restarts Flask when source files change (dev convenience).
+    # The APScheduler is initialised at module level so it runs under both the
+    # dev server and gunicorn; reloader forks a child process and the scheduler
+    # starts in that child, which is the right behaviour for local dev.
+    app.run(use_reloader=True, debug=True) 
