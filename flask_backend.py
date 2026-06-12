@@ -650,7 +650,14 @@ if PHI_ENABLED:
 # ============================================================================
 
 SESSIONS_DIR = 'sessions'
-SESSION_TIMEOUT_MINUTES = 60
+# Server-side inactivity timeout. Lowered from 60 → 5 minutes now that the
+# frontend (a) keeps active sessions alive with a throttled activity heartbeat
+# and (b) ends sessions immediately on tab close via navigator.sendBeacon.
+# This timeout is now only a backstop for the rare case where the close beacon
+# never reaches the server (browser crash, network loss, OS killing the tab),
+# so abandoned conversations surface in the dashboard within ~5 minutes instead
+# of an hour.
+SESSION_TIMEOUT_MINUTES = 5
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
 sessions = {}          # { session_id: { events, messages, last_activity, created_at } }
@@ -1937,8 +1944,12 @@ def merge_sessions():
 # and gunicorn (single-worker) without needing if __name__ == '__main__'.
 scheduler.init_app(app)
 scheduler.add_job(id='daily_task_1am', func=daily_task, trigger='cron', hour=1, minute=0)
+# Run every minute so a session that expires (SESSION_TIMEOUT_MINUTES) is
+# persisted and shown in the dashboard within ~1 minute of timing out. The job
+# is cheap (an in-memory scan) and only does LLM/disk work when a session has
+# actually crossed the inactivity cutoff.
 scheduler.add_job(id='session_cleanup', func=auto_expire_sessions,
-                  trigger='interval', minutes=5)
+                  trigger='interval', minutes=1)
 scheduler.start()
 
 if __name__ == '__main__':
