@@ -1539,6 +1539,8 @@ def list_sessions():
                 'message_count': len(messages),
                 'user_turns': user_turns,
                 'event_count': len(events),
+                'favorite': bool(data.get('favorite', False)),
+                'merged': bool(data.get('merged_from')),
                 'summary': data.get('summary', {})
             })
         # Sort newest-first by the PST created_at ISO string.
@@ -1586,6 +1588,345 @@ def get_session_detail(filename):
     except Exception as e:
         logger.error(f"Error reading session {safe_name}: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
+# SESSION MUTATION ROUTES  (favorite / delete / merge)
+# ============================================================================
+# These endpoints let the provider dashboard persist favorite flags, bulk-delete
+# sessions, and merge 2–3 sessions into a single combined session.  All three
+# are token-protected and path-traversal safe (filenames are reduced to their
+# basename and required to end in .json before any filesystem access).
+
+def _safe_session_path(filename):
+    """Return (safe_basename, abs_json_path) for a session file, or (None, None).
+
+    Strips any directory component (path-traversal guard) and rejects names
+    that don't end in .json.  Does NOT check existence — callers do that.
+    """
+    if not filename or not isinstance(filename, str):
+        return None, None
+    safe = os.path.basename(filename)
+    if not safe.endswith('.json'):
+        return None, None
+    return safe, os.path.join(SESSIONS_DIR, safe)
+
+
+def _delete_session_files(json_path):
+    """Delete a session's .json and its paired .txt (if present).
+
+    Returns True when the .json existed and was removed."""
+    removed = False
+    if os.path.exists(json_path):
+        os.remove(json_path)
+        removed = True
+    txt_path = json_path[:-len('.json')] + '.txt'
+    if os.path.exists(txt_path):
+        os.remove(txt_path)
+    return removed
+
+
+def _parse_session_iso(value):
+    """Parse a stored ISO timestamp (naive UTC or with offset) to datetime."""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+@app.route('/api/sessions/favorite', methods=['POST', 'OPTIONS'])
+@require_dashboard_token
+def set_session_favorite():
+    """Set or clear the favorite flag on a single session file (persisted to disk)."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    body = request.get_json(silent=True) or {}
+    safe, fpath = _safe_session_path(body.get('filename'))
+    favorite = bool(body.get('favorite', False))
+    if not safe:
+        return jsonify({'error': 'Invalid filename'}), 400
+    if not os.path.exists(fpath):
+        return jsonify({'error': 'Session not found'}), 404
+    try:
+        with open(fpath, 'r') as fp:
+            data = json.load(fp)
+        data['favorite'] = favorite
+        with open(fpath, 'w') as fp:
+            json.dump(data, fp, indent=2)
+        logger.info(f"Session {safe} favorite set to {favorite}")
+        return jsonify({'status': 'ok', 'filename': safe, 'favorite': favorite}), 200
+    except Exception as e:
+        logger.error(f"Error updating favorite for {safe}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/sessions/delete', methods=['POST', 'OPTIONS'])
+@require_dashboard_token
+def delete_sessions():
+    """Bulk-delete one or more session files (each .json + paired .txt)."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    body = request.get_json(silent=True) or {}
+    filenames = body.get('filenames')
+    if not isinstance(filenames, list) or not filenames:
+        return jsonify({'error': 'filenames must be a non-empty list'}), 400
+    deleted, errors = [], []
+    for fn in filenames:
+        safe, fpath = _safe_session_path(fn)
+        if not safe:
+            errors.append({'filename': str(fn), 'error': 'invalid filename'})
+            continue
+        try:
+            if _delete_session_files(fpath):
+                deleted.append(safe)
+            else:
+                errors.append({'filename': safe, 'error': 'not found'})
+        except Exception as e:
+            errors.append({'filename': safe, 'error': str(e)})
+    logger.info(f"Deleted {len(deleted)} session(s); {len(errors)} error(s).")
+    return jsonify({'deleted': deleted, 'errors': errors, 'count': len(deleted)}), 200
+
+
+# Onboarding / one-time event types that should appear only once in a merged
+# session (kept from the earliest source session, dropped from the rest).
+_MERGE_DEDUP_EVENT_TYPES = {'Disclaimer Accepted', 'Feature Tour'}
+
+
+def _lang_label(code):
+    return 'Español' if code == 'es' else 'English'
+
+
+def _build_merged_session(loaded):
+    """Combine 2–3 loaded sessions [(filename, data), ...] into one payload.
+
+    Implements the confirmed merge logic:
+      • sources ordered oldest → newest by created_at
+      • only the earliest 'Disclaimer Accepted' / 'Feature Tour' events are kept
+      • a synthetic 'Language Toggle (merged)' event is inserted at any boundary
+        where the conversation language changes between sources
+      • events are concatenated in chronological session order and re-numbered
+      • messages are concatenated into one continuous thread
+      • the earliest non-empty questionnaire (survey_responses) is retained
+      • favorite is set if ANY source was a favorite
+      • the summary is regenerated by the LLM over the merged conversation
+    """
+    ordered = sorted(loaded, key=lambda t: t[1].get('created_at') or '')
+
+    merged_events = []
+    prev_end_lang = None
+    for idx, (_safe, data) in enumerate(ordered):
+        evs = list(data.get('events', []))
+        evs.sort(key=lambda e: (e.get('timestamp', ''), e.get('seq', 0)))
+        if idx > 0:
+            evs = [e for e in evs if e.get('type') not in _MERGE_DEDUP_EVENT_TYPES]
+        # Language this source block opens in.
+        sess_start_lang = next(
+            (e.get('language') for e in evs if e.get('language')),
+            prev_end_lang or 'en',
+        )
+        if prev_end_lang is not None and evs and sess_start_lang != prev_end_lang:
+            merged_events.append({
+                'type': 'Language Toggle (merged)',
+                'timestamp': evs[0].get('timestamp'),
+                'language': sess_start_lang,
+                'details': (
+                    f'Conversation continues in {_lang_label(sess_start_lang)} '
+                    f'(inserted while merging session '
+                    f'{(data.get("session_id") or "")[:8]}).'
+                ),
+                'merged_synthetic': True,
+            })
+        merged_events.extend(evs)
+        if evs:
+            prev_end_lang = next(
+                (e.get('language') for e in reversed(evs) if e.get('language')),
+                sess_start_lang,
+            )
+
+    # Re-number seq sequentially so the merged timeline has a clean ordering.
+    for i, e in enumerate(merged_events, start=1):
+        e['seq'] = i
+
+    # Concatenate messages in chronological order (fall back to event
+    # reconstruction for old files with an empty messages array).
+    merged_messages = []
+    for _safe, data in ordered:
+        msgs = data.get('messages') or _reconstruct_messages_from_events(data.get('events', []))
+        merged_messages.extend(msgs)
+
+    # Earliest non-empty questionnaire wins.
+    survey = []
+    for _safe, data in ordered:
+        if data.get('survey_responses'):
+            survey = data.get('survey_responses')
+            break
+
+    favorite = any(data.get('favorite') for _safe, data in ordered)
+
+    text_models = list(dict.fromkeys(
+        d.get('text_model') for _s, d in ordered if d.get('text_model')))
+    audio_models = list(dict.fromkeys(
+        d.get('audio_model') for _s, d in ordered if d.get('audio_model')))
+    text_model = ', '.join(text_models) if text_models else TEXT_MODEL_LABEL
+    audio_model = ', '.join(audio_models) if audio_models else AUDIO_MODEL_LABEL
+
+    # Regenerate a single coherent summary from the merged conversation.
+    summary = generate_session_summary(merged_messages)
+
+    created_at = min((d.get('created_at') or '' for _s, d in ordered), default='')
+    ended_at = max((d.get('ended_at') or '' for _s, d in ordered), default='')
+
+    merged_id = 'merged-' + uuid.uuid4().hex[:12]
+    payload = {
+        'session_id': merged_id,
+        'created_at': created_at,
+        'ended_at': ended_at,
+        'text_model': text_model,
+        'audio_model': audio_model,
+        'events': merged_events,
+        'messages': merged_messages,
+        'survey_responses': survey,
+        'summary': summary,
+        'favorite': favorite,
+        'merged_from': [d.get('session_id') for _s, d in ordered],
+        'merged_at': datetime.utcnow().isoformat(),
+    }
+    return merged_id, payload
+
+
+def _write_merged_session_files(merged_id, payload):
+    """Persist a merged session as both .json and a human-readable .txt."""
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    json_filename = os.path.join(SESSIONS_DIR, f"session_{merged_id}_{timestamp}.json")
+    with open(json_filename, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+    txt_filename = json_filename[:-len('.json')] + '.txt'
+    created_dt = _parse_session_iso(payload.get('created_at'))
+    ended_dt = _parse_session_iso(payload.get('ended_at'))
+    if created_dt and ended_dt:
+        secs = max(0, int((ended_dt - created_dt).total_seconds()))
+        duration_str = f"{secs // 60}m {secs % 60}s"
+    else:
+        duration_str = "—"
+
+    lines = [
+        "HPV Health Assistant — MERGED Session Transcript",
+        "=" * 60,
+        f"Merged Session ID : {merged_id}",
+        f"Merged From       : {', '.join(payload.get('merged_from') or [])}",
+        f"Started           : {payload.get('created_at', '—')} UTC",
+        f"Ended             : {payload.get('ended_at', '—')} UTC",
+        f"Span              : {duration_str}",
+        "",
+    ]
+
+    survey_responses = payload.get('survey_responses') or []
+    if survey_responses:
+        lines += ["─" * 60, "QUESTIONNAIRE RESPONSES (earliest source)", "─" * 60]
+        for item in survey_responses:
+            q = (item.get("question") or "").strip()
+            a = (item.get("answer") or "").strip()
+            lines.append(f"• {q} → {a}")
+        lines.append("")
+
+    lines += ["─" * 60, "CONVERSATION", "─" * 60]
+    msgs = payload.get('messages') or []
+    if msgs:
+        for msg in msgs:
+            role = "Patient" if msg.get("role") == "user" else "Assistant"
+            lines.append(f"\n[{role}]")
+            lines.append((msg.get("content") or "").strip())
+    else:
+        lines.append("(no messages recorded)")
+
+    lines += ["", "─" * 60, "EVENT LOG", "─" * 60]
+    events = payload.get('events') or []
+    base_dt = _parse_session_iso(events[0].get('timestamp')) if events else None
+    if events:
+        for evt in events:
+            evt_dt = _parse_session_iso(evt.get('timestamp'))
+            if base_dt and evt_dt:
+                offset = max(0, int((evt_dt - base_dt).total_seconds()))
+                offset_str = f"+{offset // 60}m{offset % 60}s" if offset >= 60 else f"+{offset}s"
+            else:
+                offset_str = "?"
+            lines.append(
+                f"{offset_str:<10} {evt.get('type', ''):<26} "
+                f"{evt.get('language', ''):<6} {evt.get('details', '')}"
+            )
+    else:
+        lines.append("(no events recorded)")
+
+    lines += [
+        "", "─" * 60, "SUMMARY", "─" * 60, "",
+        "Patient Questions:", payload.get('summary', {}).get("patient_questions", "—"), "",
+        "Provider Action Items:", payload.get('summary', {}).get("action_items", "—"), "",
+    ]
+
+    with open(txt_filename, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines))
+
+    return json_filename
+
+
+@app.route('/api/sessions/merge', methods=['POST', 'OPTIONS'])
+@require_dashboard_token
+def merge_sessions():
+    """Merge 2–3 sessions into one combined session, then delete the originals."""
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+    body = request.get_json(silent=True) or {}
+    filenames = body.get('filenames')
+    if not isinstance(filenames, list) or not (2 <= len(filenames) <= 3):
+        return jsonify({'error': 'Select between 2 and 3 sessions to merge.'}), 400
+
+    # Load + validate every source before mutating anything.
+    loaded = []
+    seen = set()
+    for fn in filenames:
+        safe, fpath = _safe_session_path(fn)
+        if not safe:
+            return jsonify({'error': f'Invalid filename: {fn}'}), 400
+        if safe in seen:
+            return jsonify({'error': f'Duplicate filename: {safe}'}), 400
+        seen.add(safe)
+        if not os.path.exists(fpath):
+            return jsonify({'error': f'Session not found: {safe}'}), 404
+        try:
+            with open(fpath, 'r') as fp:
+                loaded.append((safe, json.load(fp)))
+        except Exception as e:
+            return jsonify({'error': f'Could not read {safe}: {e}'}), 500
+
+    try:
+        merged_id, payload = _build_merged_session(loaded)
+        merged_json = _write_merged_session_files(merged_id, payload)
+    except Exception as e:
+        logger.error(f"Merge failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+    # Merge succeeded → delete the originals (confirmed behaviour).
+    for safe, _data in loaded:
+        try:
+            _delete_session_files(os.path.join(SESSIONS_DIR, safe))
+        except Exception as e:
+            logger.warning(f"Could not delete source {safe} after merge: {e}")
+
+    merged_basename = os.path.basename(merged_json)
+    logger.info(f"Merged {len(loaded)} sessions → {merged_basename}")
+    return jsonify({
+        'status': 'merged',
+        'file': merged_basename,
+        'session_id': merged_id,
+        'merged_from': payload.get('merged_from'),
+        'summary': payload.get('summary'),
+    }), 200
 
 
 # ============================================================================
