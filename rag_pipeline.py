@@ -345,7 +345,7 @@ def retrieve_context_docs(pipeline, messages):
 	return pipeline.vector_store.similarity_search(last_query)
 
 
-def ask_rag_question_stream(pipeline, messages, retrieved_docs=None):
+def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_block=""):
 	"""Generator that yields raw text tokens for a streaming RAG response.
 
 	Performs the same retrieval step as the non-streaming path (similarity
@@ -361,6 +361,10 @@ def ask_rag_question_stream(pipeline, messages, retrieved_docs=None):
 			search is skipped so the caller and the LLM see exactly the same
 			chunks without performing the retrieval twice. Falls back to an
 			internal retrieval when None.
+		survey_block: Optional pre-formatted system-prompt block describing the
+			patient's pre-chat questionnaire answers. Appended to the system
+			message so the questionnaire context informs the response. Empty
+			string when no questionnaire was provided.
 
 	Yields:
 		str: Each text token/chunk from the LLM as it is produced.
@@ -377,6 +381,10 @@ def ask_rag_question_stream(pipeline, messages, retrieved_docs=None):
 		"Use the following context in your response:"
 		f"\n\n{docs_content}"
 	)
+
+	# Append the patient's questionnaire context (if any) so it reaches the LLM.
+	if survey_block:
+		system_message += survey_block
 
 	# Build the message list for the LLM.
 	# The frontend always prepends its own generic system message; we replace it

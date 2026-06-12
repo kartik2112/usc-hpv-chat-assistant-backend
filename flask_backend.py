@@ -799,6 +799,69 @@ def _reconstruct_messages_from_events(events):
     return messages
 
 
+# ---------------------------------------------------------------------------
+# Pre-chat questionnaire (survey) helpers
+# ---------------------------------------------------------------------------
+# The frontend resolves URL query params (qk1..qk6 / qm1..qm6) into a list of
+# {key, question, answer} dicts and sends them on /api/session/start and every
+# /api/chat call. We (a) sanitise the incoming list and (b) render it into a
+# system-prompt block so the patient's questionnaire answers inform every
+# OpenAI call. The sanitised list is also stored on the session and persisted.
+
+MAX_SURVEY_ITEMS = 12
+
+def sanitize_survey_responses(raw):
+    """Validate/normalise survey_responses received from the client.
+
+    Returns a list of {key, question, answer} dicts (capped at MAX_SURVEY_ITEMS).
+    Anything malformed is dropped so a crafted URL can't inject arbitrary bulk
+    text into the prompt or session files.
+    """
+    if not isinstance(raw, list):
+        return []
+    cleaned = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", ""))[:8]
+        question = str(item.get("question", "")).strip()[:300]
+        answer = str(item.get("answer", "")).strip()[:80]
+        if question and answer:
+            cleaned.append({"key": key, "question": question, "answer": answer})
+        if len(cleaned) >= MAX_SURVEY_ITEMS:
+            break
+    return cleaned
+
+
+def format_survey_block(survey_responses):
+    """Render the patient's questionnaire answers as a system-prompt block.
+
+    Returns '' when there are no responses so callers can append unconditionally.
+    """
+    if not survey_responses:
+        return ""
+    lines = []
+    for item in survey_responses:
+        if not isinstance(item, dict):
+            continue
+        question = (item.get("question") or "").strip()
+        answer = (item.get("answer") or "").strip()
+        if question and answer:
+            lines.append(f'- "{question}" — Patient answered: {answer}')
+    if not lines:
+        return ""
+    return (
+        "\n\n[Patient questionnaire context]\n"
+        "Before this conversation, the patient completed a short HPV knowledge "
+        "and attitudes questionnaire. Their responses are listed below. Use them "
+        "to understand the patient's existing knowledge and possible misconceptions, "
+        "and gently tailor your answers to correct any inaccurate beliefs and "
+        "reinforce accurate ones. Do not read the questionnaire back to the patient "
+        "or mention it explicitly unless they ask.\n\n"
+        "Patient's questionnaire responses:\n" + "\n".join(lines)
+    )
+
+
 def save_session_to_disk(session_id, session_data, summary):
     """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
@@ -834,6 +897,7 @@ def save_session_to_disk(session_id, session_data, summary):
         "audio_model": AUDIO_MODEL_LABEL,
         "events":      session_data.get("events", []),
         "messages":    clean_messages,
+        "survey_responses": session_data.get("survey_responses", []),
         "summary":     summary
     }
     with open(json_filename, 'w') as f:
@@ -853,6 +917,23 @@ def save_session_to_disk(session_id, session_data, summary):
         f"Ended      : {ended_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         f"Duration   : {duration_str}",
         "",
+    ]
+
+    # Pre-chat questionnaire (only when present)
+    survey_responses = session_data.get("survey_responses", [])
+    if survey_responses:
+        lines += [
+            "─" * 60,
+            "QUESTIONNAIRE RESPONSES",
+            "─" * 60,
+        ]
+        for item in survey_responses:
+            q = (item.get("question") or "").strip()
+            a = (item.get("answer") or "").strip()
+            lines.append(f"• {q} → {a}")
+        lines.append("")
+
+    lines += [
         "─" * 60,
         "CONVERSATION",
         "─" * 60,
@@ -969,6 +1050,11 @@ def chat():
     # correct spaCy model inside detect_phi_backend().
     language = data.get("language", "en")
 
+    # Pre-chat questionnaire answers (optional). Rendered into a system-prompt
+    # block so the patient's knowledge/attitudes inform this LLM call.
+    survey_responses = sanitize_survey_responses(data.get("survey_responses"))
+    survey_block = format_survey_block(survey_responses)
+
     # ── PHI check (fast, synchronous — runs before the stream opens) ─────────
     phi_warning = False
     phi_types   = []
@@ -1037,7 +1123,7 @@ def chat():
     def _rag_gen():
         try:
             full_response = ""
-            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs):
+            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs, survey_block=survey_block):
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
@@ -1145,13 +1231,16 @@ def audio_chat():
         language = data.get('language', 'en')
         chat_history = data.get('chat_history', [])
 
+        # Pre-chat questionnaire answers (optional) → appended to the system prompt.
+        survey_block = format_survey_block(sanitize_survey_responses(data.get('survey_responses')))
+
         logger.info(f"[A2A] Received audio (format={audio_format}, lang={language}, history_len={len(chat_history)})")
 
         # Determine voice based on language
         voice_option = 'echo' if language == 'en' else 'onyx'
 
         # Build messages for gpt-4o-audio-preview
-        messages = [{'role': 'system', 'content': SYSTEM_MESSAGE}]
+        messages = [{'role': 'system', 'content': SYSTEM_MESSAGE + survey_block}]
 
         # Add recent chat history (limit to last 10)
         if chat_history:
@@ -1261,17 +1350,22 @@ def get_mode():
 def session_start():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
+    data = request.get_json(silent=True) or {}
+    # Pre-chat questionnaire answers (optional) — stored on the session so they
+    # are persisted to disk and shown in the sessions dashboard.
+    survey_responses = sanitize_survey_responses(data.get('survey_responses'))
     session_id = str(uuid.uuid4())
     now = datetime.utcnow()
     with sessions_lock:
         sessions[session_id] = {
             'events': [],
             'messages': [],
+            'survey_responses': survey_responses,
             'last_messages_seq': -1,   # highest messages_seq applied so far (stale-overwrite guard)
             'last_activity': now,
             'created_at': now
         }
-    logger.info(f"Session started: {session_id}")
+    logger.info(f"Session started: {session_id} (survey items: {len(survey_responses)})")
     return jsonify({'session_id': session_id}), 200
 
 
