@@ -1432,14 +1432,19 @@ def list_sessions():
                        _reconstruct_messages_from_events(data.get('events', []))
             user_turns = sum(1 for m in messages if m.get('role') == 'user')
             created_at_pst = to_pst(data.get('created_at', ''))
+            events = data.get('events', [])
+            # Derive last activity from events (not the timeout-saved ended_at)
+            event_timestamps = [e.get('timestamp') for e in events if e.get('timestamp')]
+            last_event_raw = max(event_timestamps) if event_timestamps else None
             result.append({
                 'filename': fname,
                 'session_id': data.get('session_id', ''),
                 'created_at': created_at_pst,
                 'ended_at': to_pst(data.get('ended_at', '')),
+                'last_event_at': to_pst(last_event_raw) if last_event_raw else None,
                 'message_count': len(messages),
                 'user_turns': user_turns,
-                'event_count': len(data.get('events', [])),
+                'event_count': len(events),
                 'summary': data.get('summary', {})
             })
         # Sort newest-first by the PST created_at ISO string.
