@@ -28,6 +28,29 @@ chroma_setting = Settings(anonymized_telemetry=False)
 USE_CHROMA_CLOUD = True
 
 
+# Shared system-prompt instructions for the HPV assistant.
+# These were previously split between the frontend (index.html OPENAI_CONFIG.systemMessage)
+# and the backend. The frontend's system message was being discarded server-side, so all
+# instructions now live here as the single source of truth. The retrieved RAG context is
+# appended after this block by each caller.
+SYSTEM_INSTRUCTIONS = (
+	"You are a helpful medical assistant specializing ONLY in HPV-related information. "
+	"It is extremely important to follow these instructions:\n"
+	"* Provide accurate answers based on the latest medical guidelines and research.\n"
+	"* Explain things as you would to patients outside the medical field who may not be "
+	"highly educated. Avoid complex medical jargon unless absolutely necessary, and educate "
+	"in a clear, friendly manner. Do not make answers sound scary or verbose.\n"
+	"* Keep responses brief and to the point — TRY TO KEEP IT WITHIN **75 WORDS**. "
+	"BREVITY AND TERSENESS ARE SUPER IMPORTANT to avoid overwhelming patients.\n"
+	"* If you don't know the answer, simply say you don't know.\n"
+	"* If the question is not related to HPV, politely decline to answer.\n"
+	"* Refrain from asking additional questions unless clarification is needed.\n"
+	"* ASSUME THE USER'S AGE IS ABOVE 26 when generating a response. Avoid mentioning "
+	"details specific to age groups below 26.\n"
+	"Use the following context in your response:"
+)
+
+
 class HPVRAGPipeline:
 	def __init__(self, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
 		self.persist_directory = persist_directory
@@ -299,10 +322,7 @@ def build_rag_agent(openai_text_model='gpt-5.5', persist_directory="chroma_db", 
 		# print(docs_content)
 		# print([doc for doc in retrieved_docs])
 
-		system_message = (
-			"You are a helpful medical chatbot assistant. Please try to keep your responses brief, to the point, easy to understand for a layman patient using mostly commonly understandable terms. Use the following context in your response:"
-			f"\n\n{docs_content}"
-		)
+		system_message = f"{SYSTEM_INSTRUCTIONS}\n\n{docs_content}"
 
 		return system_message
 	agent = create_agent(model=rag_pipeline.openai_text_model, tools=[], middleware=[_prompt_with_context])
@@ -375,12 +395,7 @@ def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_bloc
 		retrieved_docs = retrieve_context_docs(pipeline, messages)
 	docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-	system_message = (
-		"You are a helpful medical chatbot assistant. Please try to keep your responses brief, "
-		"to the point, easy to understand for a layman patient using mostly commonly understandable terms. "
-		"Use the following context in your response:"
-		f"\n\n{docs_content}"
-	)
+	system_message = f"{SYSTEM_INSTRUCTIONS}\n\n{docs_content}"
 
 	# Append the patient's questionnaire context (if any) so it reaches the LLM.
 	if survey_block:
