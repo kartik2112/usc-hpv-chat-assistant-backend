@@ -869,6 +869,42 @@ def format_survey_block(survey_responses):
     )
 
 
+def _extract_feedback_from_events(events):
+    """Pull the end-of-session feedback answers out of the event stream.
+
+    The feedback modal logs each answer as an ordinary event
+    ('Rating Selected', 'Vaccination Intent Selected', 'Text Feedback Submitted').
+    This lifts them into a structured dict so downstream analysis doesn't have to
+    parse the event log. The *last* occurrence of each type wins — a patient who
+    changes a selection is recorded with their final answer.
+
+    Returns {} when the session has no feedback events (e.g. patient skipped, or
+    the session predates this feature).
+    """
+    _FIELD_MAP = {
+        'Rating Selected':             'rating',
+        'Vaccination Intent Selected': 'vaccination_intent',
+        'Text Feedback Submitted':     'comments',
+    }
+    feedback = {}
+    for evt in events or []:
+        field = _FIELD_MAP.get(evt.get('type', ''))
+        if not field:
+            continue
+        details = (evt.get('details') or '').strip()
+        if details:
+            feedback[field] = details
+    return feedback
+
+
+# Human-readable labels for the FEEDBACK section of the TXT transcript.
+_FEEDBACK_TXT_LABELS = [
+    ('rating',             'Experience rating'),
+    ('vaccination_intent', 'Intent to get HPV vaccine'),
+    ('comments',           'Comments'),
+]
+
+
 def save_session_to_disk(session_id, session_data, summary):
     """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
@@ -905,6 +941,7 @@ def save_session_to_disk(session_id, session_data, summary):
         "events":      session_data.get("events", []),
         "messages":    clean_messages,
         "survey_responses": session_data.get("survey_responses", []),
+        "feedback":    _extract_feedback_from_events(session_data.get("events", [])),
         "summary":     summary
     }
     with open(json_filename, 'w') as f:
@@ -975,6 +1012,19 @@ def save_session_to_disk(session_id, session_data, summary):
             lines.append(f"{offset_str:<10} {evt_type:<30} {lang:<6} {details}")
     else:
         lines.append("(no events recorded)")
+
+    # End-of-session feedback (only when the patient answered something)
+    feedback = payload["feedback"]
+    if feedback:
+        lines += [
+            "",
+            "─" * 60,
+            "END-OF-SESSION FEEDBACK",
+            "─" * 60,
+        ]
+        for key, label in _FEEDBACK_TXT_LABELS:
+            if feedback.get(key):
+                lines.append(f"• {label}: {feedback[key]}")
 
     lines += [
         "",
@@ -1588,6 +1638,11 @@ def get_session_detail(filename):
                 data.get('events', [])
             )
 
+        # Backward-compat: files saved before the structured feedback field
+        # existed still carry the answers in their event stream.
+        if not data.get('feedback'):
+            data['feedback'] = _extract_feedback_from_events(data.get('events', []))
+
         # Convert stored UTC timestamps to PST before returning
         data['created_at'] = to_pst(data.get('created_at'))
         data['ended_at']   = to_pst(data.get('ended_at'))
@@ -1798,6 +1853,7 @@ def _build_merged_session(loaded):
         'events': merged_events,
         'messages': merged_messages,
         'survey_responses': survey,
+        'feedback': _extract_feedback_from_events(merged_events),
         'summary': summary,
         'favorite': favorite,
         'merged_from': [d.get('session_id') for _s, d in ordered],
@@ -1869,6 +1925,13 @@ def _write_merged_session_files(merged_id, payload):
             )
     else:
         lines.append("(no events recorded)")
+
+    feedback = payload.get('feedback') or {}
+    if feedback:
+        lines += ["", "─" * 60, "END-OF-SESSION FEEDBACK (latest source)", "─" * 60]
+        for key, label in _FEEDBACK_TXT_LABELS:
+            if feedback.get(key):
+                lines.append(f"• {label}: {feedback[key]}")
 
     lines += [
         "", "─" * 60, "SUMMARY", "─" * 60, "",
