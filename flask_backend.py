@@ -720,6 +720,39 @@ def require_dashboard_token(f):
     return decorated
 
 
+def _strip_phi_messages(messages):
+    """Drop PHI-flagged turns, but never the app's own preloaded content.
+
+    Messages flagged `preset` come from the preloaded question buttons: both the
+    question and its answer ship with the app, so by construction they cannot
+    contain patient PHI. They still trip the PERSON recogniser on their clinical
+    wording ("Human Papillomavirus", "United States"), and filtering them out
+    left conversations built purely from preloaded questions with nothing for
+    the summary generator to work from.
+    """
+    return [
+        m for m in (messages or [])
+        if m.get("preset") or not detect_phi_backend(m.get("content", ""))
+    ]
+
+
+def _messages_fingerprint(messages):
+    """Stable content hash of a messages list.
+
+    Used to decide whether a summary cached on a live session still describes
+    the conversation, so /api/session/end can reuse it instead of paying for a
+    second LLM call — and cannot reuse it after the conversation moved on.
+    """
+    try:
+        blob = json.dumps(
+            [{"role": m.get("role"), "content": m.get("content")} for m in (messages or [])],
+            sort_keys=True, ensure_ascii=False,
+        )
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
 def generate_session_summary(messages):
     """Call the LLM to produce a patient-questions + doctor-action-items summary.
 
@@ -732,10 +765,7 @@ def generate_session_summary(messages):
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
 
         # Remove any message whose content contains PHI so it is never sent to the LLM.
-        clean_messages = [
-            m for m in messages
-            if not detect_phi_backend(m.get("content", ""))
-        ]
+        clean_messages = _strip_phi_messages(messages)
 
         if not clean_messages:
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
@@ -904,8 +934,28 @@ _FEEDBACK_TXT_LABELS = [
     ('comments',           'Comments'),
 ]
 
+# Only these keys are accepted from a client-supplied feedback payload, and each
+# is capped so a hostile client cannot bloat the saved session file.
+_FEEDBACK_OVERRIDE_KEYS = {'rating', 'vaccination_intent', 'comments'}
+_FEEDBACK_OVERRIDE_MAX_LEN = 2000
 
-def save_session_to_disk(session_id, session_data, summary):
+
+def _apply_feedback_override(feedback, override):
+    """Overlay an explicit feedback payload onto the event-derived feedback.
+
+    The explicit payload wins: it arrived with the /api/session/end request, so
+    it is guaranteed present, whereas the fire-and-forget feedback events it
+    duplicates may still be in flight when the session is popped.
+    """
+    if not isinstance(override, dict):
+        return feedback
+    for key, value in override.items():
+        if key in _FEEDBACK_OVERRIDE_KEYS and isinstance(value, str) and value.strip():
+            feedback[key] = value.strip()[:_FEEDBACK_OVERRIDE_MAX_LEN]
+    return feedback
+
+
+def save_session_to_disk(session_id, session_data, summary, feedback_override=None):
     """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     ended_at  = datetime.utcnow()
@@ -925,10 +975,12 @@ def save_session_to_disk(session_id, session_data, summary):
             )
 
     # Strip PHI-flagged messages before writing to disk (defence-in-depth).
-    clean_messages = [
-        m for m in raw_messages
-        if not detect_phi_backend(m.get("content", ""))
-    ]
+    clean_messages = _strip_phi_messages(raw_messages)
+
+    feedback = _apply_feedback_override(
+        _extract_feedback_from_events(session_data.get("events", [])),
+        feedback_override,
+    )
 
     # ── JSON ──────────────────────────────────────────────────────────────────
     json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
@@ -941,7 +993,7 @@ def save_session_to_disk(session_id, session_data, summary):
         "events":      session_data.get("events", []),
         "messages":    clean_messages,
         "survey_responses": session_data.get("survey_responses", []),
-        "feedback":    _extract_feedback_from_events(session_data.get("events", [])),
+        "feedback":    feedback,
         "summary":     summary
     }
     with open(json_filename, 'w') as f:
@@ -1060,7 +1112,16 @@ def auto_expire_sessions():
             # expired before any syncMessagesToSession() call completed.
             messages = session_data.get("messages", []) or \
                        _reconstruct_messages_from_events(session_data.get("events", []))
-            summary = generate_session_summary(messages)
+            # A session can expire while the patient is still reading the
+            # summary popup, so reuse the summary already generated for this
+            # exact conversation rather than paying for it twice.
+            fingerprint = _messages_fingerprint(messages)
+            cached = session_data.get('summary_cache')
+            if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
+                summary = cached['summary']
+                logger.info(f"Session {sid}: reusing cached summary on expiry.")
+            else:
+                summary = generate_session_summary(messages)
             save_session_to_disk(sid, session_data, summary)
             logger.info(f"Auto-expired session {sid}")
 
@@ -1476,6 +1537,69 @@ def session_log():
     return jsonify({'status': 'ok'}), 200
 
 
+@app.route('/api/session/summary', methods=['POST', 'OPTIONS'])
+def session_summary():
+    """Generate (or return a cached) summary for a session that is STILL LIVE.
+
+    Unlike /api/session/end this is non-destructive: the session stays in the
+    `sessions` dict, so the end-of-conversation feedback events the patient logs
+    after reading their summary still have a session to land in.
+
+    The result is cached on the session, keyed by a fingerprint of the messages,
+    so the /api/session/end that follows reuses it instead of paying for a
+    second LLM call. The cache invalidates itself if the conversation changes.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
+    data = request.get_json(silent=True) or {}
+    session_id   = data.get('session_id')
+    messages     = data.get('messages')       # optional final snapshot
+    messages_seq = data.get('messages_seq')   # stale-overwrite guard, as in /log
+
+    with sessions_lock:
+        session_data = sessions.get(session_id)
+        if session_data is None:
+            return jsonify({'error': 'session_expired'}), 404
+
+        # The patient is ending the conversation and is about to sit and READ
+        # this summary — count that as activity so auto_expire_sessions does not
+        # reclaim the session out from under the open modal.
+        session_data['last_activity'] = datetime.utcnow()
+
+        if messages is not None:
+            stored_seq = session_data.get('last_messages_seq', -1)
+            if messages_seq is None or messages_seq > stored_seq:
+                session_data['messages'] = messages
+                if messages_seq is not None:
+                    session_data['last_messages_seq'] = messages_seq
+
+        effective_messages = session_data.get('messages', []) or \
+                             _reconstruct_messages_from_events(session_data.get('events', []))
+
+        if not [m for m in effective_messages
+                if m.get('role') == 'user' and (m.get('content') or '').strip()]:
+            return jsonify({'status': 'skipped', 'reason': 'no_messages', 'summary': None}), 200
+
+        fingerprint = _messages_fingerprint(effective_messages)
+        cached = session_data.get('summary_cache')
+        if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
+            return jsonify({'status': 'cached', 'summary': cached['summary']}), 200
+
+    # The LLM call happens OUTSIDE sessions_lock deliberately. Holding a global
+    # lock across a multi-second completion would stall every other session's
+    # /log, /activity and /chat.
+    summary = generate_session_summary(effective_messages)
+
+    with sessions_lock:
+        sd = sessions.get(session_id)
+        if sd is not None:   # the session may have expired during the LLM call
+            sd['summary_cache'] = {'fingerprint': fingerprint, 'summary': summary}
+            sd['last_activity'] = datetime.utcnow()
+
+    return jsonify({'status': 'generated', 'summary': summary}), 200
+
+
 @app.route('/api/session/end', methods=['POST', 'OPTIONS'])
 def session_end():
     if request.method == 'OPTIONS':
@@ -1484,6 +1608,11 @@ def session_end():
     session_id = data.get('session_id')
     # Allow caller to push a final messages snapshot
     final_messages = data.get('messages')
+    # End-of-session feedback, sent explicitly rather than mined from the event
+    # stream. The events are fire-and-forget, so they can still be in flight (or
+    # already 404'd) when the session is popped below — an explicit payload is
+    # the only way to guarantee the answers survive.
+    feedback_payload = data.get('feedback')
     with sessions_lock:
         session_data = sessions.pop(session_id, None)
     if not session_data:
@@ -1509,8 +1638,20 @@ def session_end():
     # Ensure session_data carries the effective messages so save_session_to_disk
     # and generate_session_summary both see the same complete conversation.
     session_data['messages'] = effective_messages
-    summary = generate_session_summary(effective_messages)
-    filename = save_session_to_disk(session_id, session_data, summary)
+
+    # Reuse the summary /api/session/summary already generated for this exact
+    # conversation, so the normal "End Conversation → read summary → Submit"
+    # path costs one LLM call rather than two.
+    fingerprint = _messages_fingerprint(effective_messages)
+    cached = session_data.get('summary_cache')
+    if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
+        summary = cached['summary']
+        logger.info(f"Session {session_id}: reusing cached summary.")
+    else:
+        summary = generate_session_summary(effective_messages)
+
+    filename = save_session_to_disk(session_id, session_data, summary,
+                                    feedback_override=feedback_payload)
     logger.info(f"Session {session_id} ended and saved.")
     return jsonify({'status': 'saved', 'file': os.path.basename(filename), 'summary': summary}), 200
 
