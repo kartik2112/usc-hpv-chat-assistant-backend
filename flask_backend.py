@@ -720,22 +720,6 @@ def require_dashboard_token(f):
     return decorated
 
 
-def _strip_phi_messages(messages):
-    """Drop PHI-flagged turns, but never the app's own preloaded content.
-
-    Messages flagged `preset` come from the preloaded question buttons: both the
-    question and its answer ship with the app, so by construction they cannot
-    contain patient PHI. They still trip the PERSON recogniser on their clinical
-    wording ("Human Papillomavirus", "United States"), and filtering them out
-    left conversations built purely from preloaded questions with nothing for
-    the summary generator to work from.
-    """
-    return [
-        m for m in (messages or [])
-        if m.get("preset") or not detect_phi_backend(m.get("content", ""))
-    ]
-
-
 def _messages_fingerprint(messages):
     """Stable content hash of a messages list.
 
@@ -765,7 +749,10 @@ def generate_session_summary(messages):
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
 
         # Remove any message whose content contains PHI so it is never sent to the LLM.
-        clean_messages = _strip_phi_messages(messages)
+        clean_messages = [
+            m for m in messages
+            if not detect_phi_backend(m.get("content", ""))
+        ]
 
         if not clean_messages:
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
@@ -934,27 +921,6 @@ _FEEDBACK_TXT_LABELS = [
     ('comments',           'Comments'),
 ]
 
-# Only these keys are accepted from a client-supplied feedback payload, and each
-# is capped so a hostile client cannot bloat the saved session file.
-_FEEDBACK_OVERRIDE_KEYS = {'rating', 'vaccination_intent', 'comments'}
-_FEEDBACK_OVERRIDE_MAX_LEN = 2000
-
-
-def _apply_feedback_override(feedback, override):
-    """Overlay an explicit feedback payload onto the event-derived feedback.
-
-    The explicit payload wins: it arrived with the /api/session/end request, so
-    it is guaranteed present, whereas the fire-and-forget feedback events it
-    duplicates may still be in flight when the session is popped.
-    """
-    if not isinstance(override, dict):
-        return feedback
-    for key, value in override.items():
-        if key in _FEEDBACK_OVERRIDE_KEYS and isinstance(value, str) and value.strip():
-            feedback[key] = value.strip()[:_FEEDBACK_OVERRIDE_MAX_LEN]
-    return feedback
-
-
 def save_session_to_disk(session_id, session_data, summary, feedback_override=None):
     """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
@@ -975,12 +941,21 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
             )
 
     # Strip PHI-flagged messages before writing to disk (defence-in-depth).
-    clean_messages = _strip_phi_messages(raw_messages)
+    clean_messages = [
+        m for m in raw_messages
+        if not detect_phi_backend(m.get("content", ""))
+    ]
 
-    feedback = _apply_feedback_override(
-        _extract_feedback_from_events(session_data.get("events", [])),
-        feedback_override,
-    )
+    # Feedback comes from the event stream, but those events are fire-and-forget
+    # and can still be in flight when the session is popped. /api/session/end also
+    # sends the answers directly, and that copy wins because it is guaranteed to
+    # have arrived. Only the three known fields are read, so the saved shape stays
+    # the same whichever path supplied it.
+    feedback = _extract_feedback_from_events(session_data.get("events", []))
+    for key in ('rating', 'vaccination_intent', 'comments'):
+        value = (feedback_override or {}).get(key)
+        if isinstance(value, str) and value.strip():
+            feedback[key] = value.strip()
 
     # ── JSON ──────────────────────────────────────────────────────────────────
     json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
@@ -1562,9 +1537,11 @@ def session_summary():
         if session_data is None:
             return jsonify({'error': 'session_expired'}), 404
 
-        # The patient is ending the conversation and is about to sit and READ
-        # this summary — count that as activity so auto_expire_sessions does not
-        # reclaim the session out from under the open modal.
+        # Keep the session alive for the rest of the end-of-conversation flow.
+        # This fires at confirm time, but the patient still has to answer the
+        # feedback questions and dismiss the summary before /api/session/end
+        # runs, so without this touch auto_expire_sessions could reclaim the
+        # session in between.
         session_data['last_activity'] = datetime.utcnow()
 
         if messages is not None:
@@ -1640,7 +1617,7 @@ def session_end():
     session_data['messages'] = effective_messages
 
     # Reuse the summary /api/session/summary already generated for this exact
-    # conversation, so the normal "End Conversation → read summary → Submit"
+    # conversation, so the normal "End Conversation → submit feedback → summary"
     # path costs one LLM call rather than two.
     fingerprint = _messages_fingerprint(effective_messages)
     cached = session_data.get('summary_cache')
