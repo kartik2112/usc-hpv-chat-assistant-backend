@@ -12,6 +12,72 @@ Key |	Value
 `SESSIONS_PASSWORD_HASH` |	`$2b$12$...` (output from step 1)
 `SESSIONS_TOKEN_SECRET` |	the hex string from step 2
 
+One password opens the whole dashboard — both pages (sessions + sources) and both
+conversation types, with a switch between them in the header. The types a token grants
+are signed into it and re-checked by every dashboard endpoint, so access cannot be
+widened in the browser.
+
+---
+
+## Variants: general vs post-partum
+
+The assistant has two audiences, defined once in `variants.py` (the frontend's
+`variants.js` must use the same keys):
+
+| Variant | Patient link | Saved to |
+|---|---|---|
+| `general` | `index.html?variant=general` | `sessions/general/session_general_<uuid>_<ts>.{json,txt}` |
+| `postpartum` | `index.html?variant=postpartum` | `sessions/postpartum/session_postpartum_<uuid>_<ts>.{json,txt}` |
+
+Without `?variant=` the patient page asks which one to use. The variant is fixed when the
+session starts (`/api/session/start`) and selects the audience lines of the system prompt
+and summary prompt. Saved files carry it in their name, in the JSON (`"variant"`) and in
+the TXT header. On first start, transcripts saved before variants existed are moved into
+`sessions/general/` automatically.
+
+Offline tests for this behaviour: `uv run pytest test_variants.py -v`.
+
+---
+
+## RAG sources (one Chroma collection per variant)
+
+Each variant answers from **its own** vector store, listed in `rag_sources.json`:
+
+```json
+"postpartum": {
+  "chroma":  { "database": "Demo", "collection": "hpv_postpartum_rag" },
+  "sources": [
+    { "url": "https://example.org/handout.pdf", "title": "Optional label" },
+    "https://example.org/a-page"
+  ]
+}
+```
+
+- `sources` are web pages or PDF URLs; both are crawled, split and embedded.
+- To point a variant at a **different Chroma account**, add `"api_key_env"` / `"tenant_env"`
+  to its `chroma` block with the names of the env vars holding those credentials
+  (default `CHROMA_API_KEY` / `CHROMA_TENANT`). The file never holds secrets itself.
+- Two variants may **not** share a collection: each build deletes chunks whose URL is
+  not in its own list, so a shared collection would erase the other variant's sources.
+  Startup refuses to run in that case.
+- The file is read at startup and again by the nightly refresh (1 AM), so curating
+  sources on the server needs no redeploy. Set `RAG_SOURCES_FILE=/path/to/file.json`
+  to keep it outside the repo (recommended on sackend, so `git pull` can't overwrite it).
+  On Render the filesystem is ephemeral — edit the copy in the repo and redeploy.
+- A broken file or a failed rebuild is logged and the previous index keeps serving.
+- Adding a variant's first collection re-embeds every source once (OpenAI embedding cost).
+
+Providers see what is indexed at `sources.html` in the frontend, which reads
+`GET /api/rag/sources?variant=<key>` (dashboard token, same variant scoping as the
+session endpoints). **The listing comes from Chroma itself** — the endpoint reads the
+collection's chunk metadata on every call, so it shows what the assistant can actually
+retrieve, with a live chunk count per source. This file is consulted only for the
+optional titles and to flag the two ways the two can disagree: `not_indexed` (configured
+here, nothing in Chroma yet — newly added, or its crawl failed) and `not_in_config`
+(still in Chroma, dropped from this file, so the next refresh deletes it).
+
+Offline tests: `uv run pytest test_rag_sources.py -v`.
+
 ---
 
 ## Session inactivity & close detection

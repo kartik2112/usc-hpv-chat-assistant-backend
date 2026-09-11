@@ -9,6 +9,7 @@ import shutil
 import tempfile
 from typing import Set
 import hashlib
+from datetime import datetime, timezone
 
 import requests
 from bs4 import SoupStrainer
@@ -28,12 +29,11 @@ chroma_setting = Settings(anonymized_telemetry=False)
 USE_CHROMA_CLOUD = True
 
 
-# Shared system-prompt instructions for the HPV assistant.
-# These were previously split between the frontend (index.html OPENAI_CONFIG.systemMessage)
-# and the backend. The frontend's system message was being discarded server-side, so all
-# instructions now live here as the single source of truth. The retrieved RAG context is
-# appended after this block by each caller.
-SYSTEM_INSTRUCTIONS = (
+# Shared system-prompt rules for the HPV assistant — the single source of truth
+# (the frontend sends no system message). Audience-specific lines (general vs
+# post-partum, see variants.py) are inserted by build_system_prompt(), and the
+# retrieved RAG context is appended after the result by each caller.
+BASE_SYSTEM_RULES = (
 	"You are a helpful medical assistant specializing ONLY in HPV-related information. "
 	"It is extremely important to follow these instructions:\n"
 	"* Provide accurate answers based on the latest medical guidelines and research.\n"
@@ -45,15 +45,27 @@ SYSTEM_INSTRUCTIONS = (
 	"* If you don't know the answer, simply say you don't know.\n"
 	"* If the question is not related to HPV, politely decline to answer.\n"
 	"* Refrain from asking additional questions unless clarification is needed.\n"
-	"* ASSUME THE USER'S AGE IS ABOVE 26 when generating a response. Avoid mentioning "
-	"details specific to age groups below 26.\n"
-	"Use the following context in your response:"
 )
 
 
+def build_system_prompt(audience_instructions="", with_context_header=True):
+	"""Base rules + audience-specific bullet lines (+ the RAG context header,
+	which callers that append no retrieved context should leave out)."""
+	prompt = f"{BASE_SYSTEM_RULES}{audience_instructions}"
+	return prompt + "Use the following context in your response:" if with_context_header else prompt
+
+
 class HPVRAGPipeline:
-	def __init__(self, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
-		self.persist_directory = persist_directory
+	"""One vector store + its source list (one per variant — see rag_sources.json).
+
+	`rag_sources` is a rag_sources.RagSources: the Chroma target and the web page /
+	PDF URLs to index. After construction, `index_report` holds the outcome of
+	this build for each URL (see _record) and `built_at` its UTC time.
+	"""
+	def __init__(self, rag_sources, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
+		self.rag_sources = rag_sources
+		# Local (non-cloud) mode keeps one directory per collection.
+		self.persist_directory = os.path.join(persist_directory, rag_sources.chroma.collection)
 
 		self.openai_text_model = openai_text_model
 
@@ -67,16 +79,18 @@ class HPVRAGPipeline:
 
 		
 		# Initialize Vector Store
+		target = rag_sources.chroma
 		if USE_CHROMA_CLOUD:
 			self.vector_store =  Chroma(
-				collection_name="hpv_facts_rag",
+				collection_name=target.collection,
 				embedding_function=self.embeddings,
-				chroma_cloud_api_key=os.getenv("CHROMA_API_KEY"),
-				tenant=os.getenv("CHROMA_TENANT"),
-				database="Demo",
+				chroma_cloud_api_key=os.getenv(target.api_key_env),
+				tenant=os.getenv(target.tenant_env),
+				database=target.database,
 			)
 		else:
-			self.vector_store =  Chroma(embedding_function= self.embeddings,
+			self.vector_store =  Chroma(collection_name=target.collection,
+				embedding_function= self.embeddings,
 				persist_directory=self.persist_directory,
 				client_settings=chroma_setting,
 			)
@@ -89,17 +103,9 @@ class HPVRAGPipeline:
 
 		self.existing_urls = set()
 		self.existing_urls_to_chroma_ids = defaultdict(list)
-		self.urls = [
-			"https://www.acog.org/womens-health/faqs/hpv-vaccination",
-			"https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer",
-			"https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html",
-			"https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf",
-			"https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf",
-			"https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv",
-			"https://pubmed.ncbi.nlm.nih.gov/39982254/",
-			"https://asccp.org/wp-content/uploads/2025/11/ASCCP-Practice-Advisory-Self-Collection-for-Cervical-Cancer-Screening-final-updated-10-2-25.pdf",
-			"https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590",
-		]
+		self.urls = rag_sources.urls
+		self.index_report = {}      # url -> {status, chunks, kind}; see _record()
+		self.removed_urls = []      # URLs dropped from the collection by this build
 
 		self.text_splitter = RecursiveCharacterTextSplitter(
 			chunk_size=1000,  # chunk size (characters)
@@ -125,6 +131,7 @@ class HPVRAGPipeline:
 			self._alt_crawl_webpage_and_add_to_rag(url=url)
 		if USE_CHROMA_CLOUD:
 			self.clean_up_extra_urls()
+		self.built_at = datetime.now(timezone.utc).isoformat()
 
 		# Create QA chain
 		# self.qa_chain = ConversationalRetrievalChain.from_llm(
@@ -133,6 +140,31 @@ class HPVRAGPipeline:
 		# 												search_kwargs={"k": 5}),
 		# 	return_source_documents=True
 		# )
+
+	def describe_indexed_sources(self):
+		"""What this collection actually holds in Chroma right now.
+
+		Reads chunk metadata straight from the vector store, so callers see
+		Chroma itself rather than the sources file — the two can differ if the
+		file was edited since the last refresh, or a crawl failed.
+
+		Returns {url: {"chunks": int, "kind": "pdf"|"web", "fulltext_hash": str}}.
+		Note this pulls the metadata of every chunk in the collection (a few
+		hundred here); it is a read-only call and makes no embeddings.
+		"""
+		entries = self.vector_store.get(include=["metadatas"])
+		indexed = {}
+		for metadata in entries.get("metadatas") or []:
+			metadata = metadata or {}
+			url = metadata.get("source")
+			if not url:
+				continue
+			row = indexed.setdefault(url, {"chunks": 0, "kind": "web",
+										   "fulltext_hash": metadata.get("fulltext_hash")})
+			row["chunks"] += 1
+			if "page" in metadata:      # PyPDFLoader tags PDF chunks with a page number
+				row["kind"] = "pdf"
+		return indexed
 
 	def get_string_hash(self, docs):
 		return hashlib.sha256("\n".join([doc.page_content for doc in docs]).encode('utf-8')).hexdigest()
@@ -154,6 +186,7 @@ class HPVRAGPipeline:
 			for url in self.existing_urls_to_chroma_ids.keys():
 				if url not in self.urls:
 					self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
+					self.removed_urls.append(url)
 					print(f"Removed URL {url} from Chroma Cloud.")
 
 	def _crawl_url(self, url):
@@ -206,21 +239,34 @@ class HPVRAGPipeline:
 				print(f"Error loading PDF: {str(e)}")
 		return None
 
+	def _record(self, url, status, chunks, kind=None):
+		"""Note what this build did with a URL, for the sources viewer.
+
+		status: 'added' (new), 'updated' (content changed), 'unchanged', or
+		'failed' (could not be fetched — any chunks from an earlier build stay).
+		kind: 'pdf' or 'web' when the content was loaded, else None.
+		"""
+		self.index_report[url] = {"status": status, "chunks": chunks, "kind": kind}
+
 	def _alt_crawl_webpage_and_add_to_rag(self, url):
 		print(f"Crawling webpage: {url}")
 		docs = self._crawl_url(url)
+		previous_ids = self.existing_urls_to_chroma_ids[url]
 
 		if docs is None:
+			self._record(url, "failed", len(previous_ids))
 			return
+		kind = "pdf" if "page" in (docs[0].metadata or {}) else "web"   # PyPDFLoader adds 'page'
 		all_splits = self.text_splitter.split_documents(docs)
 		fulltext_hash = self.get_string_hash(docs)
 
 		if (url, fulltext_hash) in self.existing_urls:
 			print(f"URL {url} with hash {fulltext_hash} already exists.")
+			self._record(url, "unchanged", len(previous_ids), kind)
 			return
 		else:
-			if USE_CHROMA_CLOUD and len(self.existing_urls_to_chroma_ids[url]) > 0:
-				self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
+			if USE_CHROMA_CLOUD and len(previous_ids) > 0:
+				self.vector_store.delete(ids=previous_ids)
 			print(f"Adding new content from URL {url}")
 			# if not(USE_CHROMA_CLOUD):
 			# 	print(docs)
@@ -234,6 +280,7 @@ class HPVRAGPipeline:
 
 			document_ids = self.vector_store.add_documents(documents=all_splits)
 			print(document_ids)
+			self._record(url, "updated" if previous_ids else "added", len(document_ids), kind)
 
 	# def _crawl_webpage_and_add_to_rag(self, url):
 	# 	try:
@@ -310,8 +357,18 @@ class HPVRAGPipeline:
 	# 	except Exception as e:
 	# 		raise Exception(f"Error generating response: {str(e)}")
 		
-def build_rag_agent(openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
-	rag_pipeline = HPVRAGPipeline(openai_text_model=openai_text_model, persist_directory=persist_directory, max_completion_tokens=max_completion_tokens)
+def build_rag_pipeline(rag_sources, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200):
+	"""Crawl `rag_sources` (a rag_sources.RagSources) into its Chroma collection
+	and return the ready pipeline — this is what the backend uses per variant."""
+	return HPVRAGPipeline(rag_sources, openai_text_model=openai_text_model,
+		persist_directory=persist_directory, max_completion_tokens=max_completion_tokens)
+
+
+def build_rag_agent(rag_sources, openai_text_model='gpt-5.5', persist_directory="chroma_db", max_completion_tokens=1200, audience_instructions=""):
+	"""Legacy non-streaming LangChain agent over one pipeline (not used by the
+	Flask app; kept for notebook experiments). Returns (agent, pipeline)."""
+	rag_pipeline = build_rag_pipeline(rag_sources, openai_text_model=openai_text_model,
+		persist_directory=persist_directory, max_completion_tokens=max_completion_tokens)
 	@dynamic_prompt
 	def _prompt_with_context(request: ModelRequest) -> str:
 		"""Inject context into state messages."""
@@ -322,7 +379,7 @@ def build_rag_agent(openai_text_model='gpt-5.5', persist_directory="chroma_db", 
 		# print(docs_content)
 		# print([doc for doc in retrieved_docs])
 
-		system_message = f"{SYSTEM_INSTRUCTIONS}\n\n{docs_content}"
+		system_message = f"{build_system_prompt(audience_instructions)}\n\n{docs_content}"
 
 		return system_message
 	agent = create_agent(model=rag_pipeline.openai_text_model, tools=[], middleware=[_prompt_with_context])
@@ -365,7 +422,7 @@ def retrieve_context_docs(pipeline, messages):
 	return pipeline.vector_store.similarity_search(last_query)
 
 
-def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_block=""):
+def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_block="", audience_instructions=""):
 	"""Generator that yields raw text tokens for a streaming RAG response.
 
 	Performs the same retrieval step as the non-streaming path (similarity
@@ -385,6 +442,8 @@ def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_bloc
 			patient's pre-chat questionnaire answers. Appended to the system
 			message so the questionnaire context informs the response. Empty
 			string when no questionnaire was provided.
+		audience_instructions: Variant-specific system-prompt lines (see
+			variants.py), e.g. post-partum framing. Empty string for none.
 
 	Yields:
 		str: Each text token/chunk from the LLM as it is produced.
@@ -395,7 +454,7 @@ def ask_rag_question_stream(pipeline, messages, retrieved_docs=None, survey_bloc
 		retrieved_docs = retrieve_context_docs(pipeline, messages)
 	docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
-	system_message = f"{SYSTEM_INSTRUCTIONS}\n\n{docs_content}"
+	system_message = f"{build_system_prompt(audience_instructions)}\n\n{docs_content}"
 
 	# Append the patient's questionnaire context (if any) so it reaches the LLM.
 	if survey_block:

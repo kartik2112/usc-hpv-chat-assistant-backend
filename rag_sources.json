@@ -1,0 +1,37 @@
+{
+  "_about": "RAG sources per variant (keys must match variants.py). Each variant gets its own Chroma collection; 'sources' are web pages or PDF URLs crawled into it. Edited on the server: re-read by the nightly refresh (1 AM) or on restart. See README 'RAG sources'.",
+  "general": {
+    "chroma": {
+      "database": "Demo",
+      "collection": "hpv_facts_rag"
+    },
+    "sources": [
+      { "url": "https://www.acog.org/womens-health/faqs/hpv-vaccination", "title": "ACOG — HPV Vaccination FAQ" },
+      { "url": "https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer", "title": "WHO — HPV and cancer fact sheet" },
+      { "url": "https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html", "title": "CDC — HPV vaccination considerations" },
+      { "url": "https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf" },
+      { "url": "https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf", "title": "American Cancer Society — HPV and Cancer" },
+      { "url": "https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv", "title": "Planned Parenthood — HPV" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/39982254/" },
+      { "url": "https://asccp.org/wp-content/uploads/2025/11/ASCCP-Practice-Advisory-Self-Collection-for-Cervical-Cancer-Screening-final-updated-10-2-25.pdf", "title": "ASCCP — Self-collection for cervical cancer screening" },
+      { "url": "https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590" }
+    ]
+  },
+  "postpartum": {
+    "chroma": {
+      "database": "Demo",
+      "collection": "hpv_postpartum_rag"
+    },
+    "sources": [
+      { "url": "https://www.acog.org/womens-health/faqs/hpv-vaccination", "title": "ACOG — HPV Vaccination FAQ" },
+      { "url": "https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer", "title": "WHO — HPV and cancer fact sheet" },
+      { "url": "https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html", "title": "CDC — HPV vaccination considerations" },
+      { "url": "https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf" },
+      { "url": "https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf", "title": "American Cancer Society — HPV and Cancer" },
+      { "url": "https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv", "title": "Planned Parenthood — HPV" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/39982254/" },
+      { "url": "https://asccp.org/wp-content/uploads/2025/11/ASCCP-Practice-Advisory-Self-Collection-for-Cervical-Cancer-Screening-final-updated-10-2-25.pdf", "title": "ASCCP — Self-collection for cervical cancer screening" },
+      { "url": "https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590" }
+    ]
+  }
+}
