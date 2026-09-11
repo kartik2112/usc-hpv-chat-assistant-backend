@@ -141,6 +141,31 @@ class HPVRAGPipeline:
 		# 	return_source_documents=True
 		# )
 
+	def describe_indexed_sources(self):
+		"""What this collection actually holds in Chroma right now.
+
+		Reads chunk metadata straight from the vector store, so callers see
+		Chroma itself rather than the sources file — the two can differ if the
+		file was edited since the last refresh, or a crawl failed.
+
+		Returns {url: {"chunks": int, "kind": "pdf"|"web", "fulltext_hash": str}}.
+		Note this pulls the metadata of every chunk in the collection (a few
+		hundred here); it is a read-only call and makes no embeddings.
+		"""
+		entries = self.vector_store.get(include=["metadatas"])
+		indexed = {}
+		for metadata in entries.get("metadatas") or []:
+			metadata = metadata or {}
+			url = metadata.get("source")
+			if not url:
+				continue
+			row = indexed.setdefault(url, {"chunks": 0, "kind": "web",
+										   "fulltext_hash": metadata.get("fulltext_hash")})
+			row["chunks"] += 1
+			if "page" in metadata:      # PyPDFLoader tags PDF chunks with a page number
+				row["kind"] = "pdf"
+		return indexed
+
 	def get_string_hash(self, docs):
 		return hashlib.sha256("\n".join([doc.page_content for doc in docs]).encode('utf-8')).hexdigest()
 

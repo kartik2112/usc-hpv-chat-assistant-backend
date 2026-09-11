@@ -17,8 +17,7 @@ import sys
 import bcrypt
 import pytest
 
-MASTER_PW = 'master-pw'
-POSTPARTUM_PW = 'pp-only-pw'
+DASHBOARD_PW = 'dashboard-pw'
 LEGACY_FILE = 'session_11111111-legacy_20250101_000000.json'
 
 
@@ -27,7 +26,11 @@ def _hash(pw):
 
 
 class FakePipeline:
-    """Stand-in for HPVRAGPipeline: records its sources, indexes nothing."""
+    """Stand-in for HPVRAGPipeline with a fake Chroma collection.
+
+    `indexed` is what describe_indexed_sources() reports — tests mutate it to
+    simulate Chroma holding more or less than the sources file lists.
+    """
 
     def __init__(self, rag_sources, **kwargs):
         self.rag_sources = rag_sources
@@ -38,6 +41,17 @@ class FakePipeline:
                     'kind': 'pdf' if s.url.endswith('.pdf') else 'web'}
             for s in rag_sources.sources
         }
+        self.indexed = {
+            s.url: {'chunks': 3, 'kind': 'pdf' if s.url.endswith('.pdf') else 'web',
+                    'fulltext_hash': 'abc'}
+            for s in rag_sources.sources
+        }
+        self.raise_on_read = None       # set to an Exception to simulate Chroma being down
+
+    def describe_indexed_sources(self):
+        if self.raise_on_read:
+            raise self.raise_on_read
+        return dict(self.indexed)
 
 
 @pytest.fixture(scope='session')
@@ -53,8 +67,7 @@ def fb(tmp_path_factory):
         'RENDER': '1',                     # PHI_ENABLED=False → no spaCy
         'OPENAI_API_KEY': 'test-key',
         'SESSIONS_TOKEN_SECRET': 'test-secret',
-        'SESSIONS_PASSWORD_HASH': _hash(MASTER_PW),
-        'SESSIONS_PASSWORD_HASH_POSTPARTUM': _hash(POSTPARTUM_PW),
+        'SESSIONS_PASSWORD_HASH': _hash(DASHBOARD_PW),
     })
     import rag_pipeline
     real_build = rag_pipeline.build_rag_pipeline

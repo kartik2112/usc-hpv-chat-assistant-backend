@@ -11,12 +11,11 @@ Then add two environment variables in Render's dashboard / server:
 Key |	Value
 `SESSIONS_PASSWORD_HASH` |	`$2b$12$...` (output from step 1)
 `SESSIONS_TOKEN_SECRET` |	the hex string from step 2
-`SESSIONS_PASSWORD_HASH_POSTPARTUM` | *(optional)* a second bcrypt hash whose password opens **only** post-partum conversations
 
-`SESSIONS_PASSWORD_HASH` opens every conversation type (general + post-partum) and the
-dashboard offers a switch between them. Any `SESSIONS_PASSWORD_HASH_<VARIANT>` password is
-limited to that one type — the allowed types are signed into the dashboard token and
-re-checked by every dashboard endpoint.
+One password opens the whole dashboard — both pages (sessions + sources) and both
+conversation types, with a switch between them in the header. The types a token grants
+are signed into it and re-checked by every dashboard endpoint, so access cannot be
+widened in the browser.
 
 ---
 
@@ -68,11 +67,14 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
 - A broken file or a failed rebuild is logged and the previous index keeps serving.
 - Adding a variant's first collection re-embeds every source once (OpenAI embedding cost).
 
-Providers can see what is indexed at `sources.html` in the frontend, which reads
+Providers see what is indexed at `sources.html` in the frontend, which reads
 `GET /api/rag/sources?variant=<key>` (dashboard token, same variant scoping as the
-session endpoints). It reports per source: status of the last build
-(`added` / `updated` / `unchanged` / `failed`), chunk count, and `pending` /
-`pending_removal` for file edits the next refresh will apply.
+session endpoints). **The listing comes from Chroma itself** — the endpoint reads the
+collection's chunk metadata on every call, so it shows what the assistant can actually
+retrieve, with a live chunk count per source. This file is consulted only for the
+optional titles and to flag the two ways the two can disagree: `not_indexed` (configured
+here, nothing in Chroma yet — newly added, or its crawl failed) and `not_in_config`
+(still in Chroma, dropped from this file, so the next refresh deletes it).
 
 Offline tests: `uv run pytest test_rag_sources.py -v`.
 

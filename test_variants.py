@@ -18,7 +18,7 @@ import os
 
 import pytest
 
-from conftest import LEGACY_FILE, MASTER_PW, POSTPARTUM_PW, auth_header as _auth, token_for as _token
+from conftest import DASHBOARD_PW, LEGACY_FILE, auth_header as _auth, token_for as _token
 
 
 def _run_conversation(client, variant):
@@ -88,29 +88,35 @@ def test_session_variant_cannot_be_switched(fb, client):
 
 # ── Dashboard scoping ─────────────────────────────────────────────────────────
 
-def test_master_password_sees_each_variant_separately(client):
+def test_one_password_opens_both_views_separately(client):
+    """A single dashboard password sees every variant, but each view lists only
+    its own conversations."""
     pp_sid = _run_conversation(client, 'postpartum')
-    token = _token(client, MASTER_PW)
+    resp = client.post('/api/sessions/auth', json={'password': DASHBOARD_PW})
+    assert resp.get_json()['variants'] == ['general', 'postpartum']
+    token = resp.get_json()['token']
     general = client.get('/api/sessions?variant=general', headers=_auth(token)).get_json()
     postpartum = client.get('/api/sessions?variant=postpartum', headers=_auth(token)).get_json()
     assert pp_sid in {s['session_id'] for s in postpartum['sessions']}
     assert pp_sid not in {s['session_id'] for s in general['sessions']}
 
 
-def test_postpartum_password_is_scoped(client):
-    resp = client.post('/api/sessions/auth', json={'password': POSTPARTUM_PW})
-    assert resp.get_json()['variants'] == ['postpartum']
-    token = resp.get_json()['token']
-    assert client.get('/api/sessions?variant=postpartum', headers=_auth(token)).status_code == 200
-    assert client.get('/api/sessions?variant=general', headers=_auth(token)).status_code == 403
-    assert client.post('/api/sessions/delete?variant=general', headers=_auth(token),
+def test_token_scope_is_enforced(fb, client):
+    """Scope still gates every dashboard route, so a narrower token (should one
+    ever be issued) cannot reach another variant."""
+    narrow = _auth(fb._make_dashboard_token({'postpartum'}))
+    assert client.get('/api/sessions?variant=postpartum', headers=narrow).status_code == 200
+    assert client.get('/api/sessions?variant=general', headers=narrow).status_code == 403
+    assert client.post('/api/sessions/delete?variant=general', headers=narrow,
                        json={'filenames': ['x.json']}).status_code == 403
 
 
-def test_tampered_or_legacy_tokens_rejected(client):
-    expiry, _scope, sig = _token(client, POSTPARTUM_PW).split('.')
+def test_tampered_or_legacy_tokens_rejected(fb, client):
+    # Editing the scope in a token breaks its signature.
+    expiry, _scope, sig = fb._make_dashboard_token({'postpartum'}).split('.')
     widened = f'{expiry}.general,postpartum.{sig}'
     assert client.get('/api/sessions?variant=general', headers=_auth(widened)).status_code == 401
+    # A token in the pre-variant '<expiry>.<sig>' format is no longer accepted.
     assert client.get('/api/sessions', headers=_auth(f'{expiry}.{sig}')).status_code == 401
 
 
@@ -118,7 +124,7 @@ def test_dashboard_cannot_reach_other_variant_files(client):
     sid = _run_conversation(client, 'general')
     [path] = glob.glob(os.path.join('sessions', 'general', f'*{sid}*.json'))
     fname = os.path.basename(path)
-    token = _token(client, MASTER_PW)
+    token = _token(client, DASHBOARD_PW)
     # Traversal is stripped to the basename, which does not exist in postpartum/.
     resp = client.get(f'/api/sessions/..%2Fgeneral%2F{fname}?variant=postpartum', headers=_auth(token))
     assert resp.status_code == 404

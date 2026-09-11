@@ -15,7 +15,7 @@ import json
 import pytest
 
 import rag_sources
-from conftest import MASTER_PW, POSTPARTUM_PW, auth_header as _auth, token_for as _token
+from conftest import DASHBOARD_PW, auth_header as _auth, token_for as _token
 
 VALID = {
     "_comment": "ignored",
@@ -100,47 +100,73 @@ def test_chat_retrieves_from_the_sessions_variant(fb, client, monkeypatch):
 
 # ── Viewer endpoint ───────────────────────────────────────────────────────────
 
-def test_sources_endpoint_lists_indexed_sources(fb, client):
+def test_sources_endpoint_lists_what_chroma_holds(fb, client):
     body = client.get('/api/rag/sources?variant=postpartum',
-                      headers=_auth(_token(client, MASTER_PW))).get_json()
+                      headers=_auth(_token(client, DASHBOARD_PW))).get_json()
+    pipeline = fb._rag_pipelines['postpartum']
     assert body['variant'] == 'postpartum'
-    assert body['chroma']['collection'] == fb._rag_pipelines['postpartum'].rag_sources.chroma.collection
-    assert body['config_error'] is None and body['chroma_pending'] is None
-    assert body['sources'] and all(s['status'] == 'unchanged' and s['chunks'] == 3 for s in body['sources'])
+    assert body['chroma']['collection'] == pipeline.rag_sources.chroma.collection
+    assert body['live_error'] is None and body['config_error'] is None
+    assert body['fetched_at'] and body['built_at']
+    # Rows mirror the collection's contents.
+    assert {s['url'] for s in body['sources']} == set(pipeline.indexed)
+    assert all(s['status'] == 'indexed' and s['chunks'] == 3 for s in body['sources'])
     assert {s['kind'] for s in body['sources']} <= {'pdf', 'web'}
     # Only database/collection — no credentials and no env var names.
     assert set(body['chroma']) == {'database', 'collection'}
     assert not {'api_key_env', 'tenant_env', 'CHROMA_API_KEY', 'CHROMA_TENANT'} & set(json.dumps(body).split('"'))
 
 
-def test_sources_endpoint_shows_pending_edits(fb, client, tmp_path, monkeypatch):
-    """Edits to the file show up before the nightly refresh applies them."""
+def test_rows_come_from_chroma_not_the_file(fb, client, tmp_path, monkeypatch):
+    """A URL only in Chroma is listed; one only in the file is flagged, not counted."""
+    pipeline = fb._rag_pipelines['general']
+    monkeypatch.setitem(pipeline.indexed, 'https://example.org/only-in-chroma',
+                        {'chunks': 5, 'kind': 'web', 'fulltext_hash': 'z'})
     edited = json.loads(json.dumps(VALID))
-    live = fb._rag_pipelines['general'].rag_sources
-    edited['general']['chroma']['collection'] = live.chroma.collection
-    edited['general']['sources'] = [live.urls[0], 'https://example.org/new']
+    edited['general']['chroma']['collection'] = pipeline.rag_sources.chroma.collection
+    edited['general']['sources'] = [pipeline.rag_sources.urls[0], 'https://example.org/only-in-file']
     monkeypatch.setattr(rag_sources, 'RAG_SOURCES_FILE', _write(tmp_path, edited))
 
     body = client.get('/api/rag/sources?variant=general',
-                      headers=_auth(_token(client, MASTER_PW))).get_json()
-    rows = {s['url']: s['status'] for s in body['sources']}
-    assert rows['https://example.org/new'] == 'pending'
-    assert rows[live.urls[0]] == 'unchanged'
-    assert rows[live.urls[1]] == 'pending_removal'
+                      headers=_auth(_token(client, DASHBOARD_PW))).get_json()
+    rows = {s['url']: s for s in body['sources']}
+    assert rows['https://example.org/only-in-chroma']['status'] == 'not_in_config'
+    assert rows['https://example.org/only-in-chroma']['chunks'] == 5
+    assert rows[pipeline.rag_sources.urls[0]]['status'] == 'indexed'
+    assert rows['https://example.org/only-in-file']['status'] == 'not_indexed'
+    assert rows['https://example.org/only-in-file']['chunks'] == 0
 
 
-def test_sources_endpoint_reports_a_broken_config(fb, client, tmp_path, monkeypatch):
+def test_sources_endpoint_survives_a_broken_config(fb, client, tmp_path, monkeypatch):
+    """Chroma is still described in full when the sources file can't be read."""
     bad = tmp_path / 'broken.json'
     bad.write_text('{ not json')
     monkeypatch.setattr(rag_sources, 'RAG_SOURCES_FILE', str(bad))
     body = client.get('/api/rag/sources?variant=general',
-                      headers=_auth(_token(client, MASTER_PW))).get_json()
-    assert body['config_error']                      # surfaced to the provider
-    assert body['sources']                           # live index still described
+                      headers=_auth(_token(client, DASHBOARD_PW))).get_json()
+    assert body['config_error']                                    # surfaced to the provider
+    assert {s['url'] for s in body['sources']} == set(fb._rag_pipelines['general'].indexed)
+    assert all(s['status'] == 'indexed' for s in body['sources'])   # config unknown → no false flags
 
 
-def test_sources_endpoint_respects_token_scope(client):
-    pp_token = _token(client, POSTPARTUM_PW)
-    assert client.get('/api/rag/sources?variant=postpartum', headers=_auth(pp_token)).status_code == 200
-    assert client.get('/api/rag/sources?variant=general', headers=_auth(pp_token)).status_code == 403
+def test_sources_endpoint_reports_chroma_failure(fb, client, monkeypatch):
+    pipeline = fb._rag_pipelines['general']
+    monkeypatch.setattr(pipeline, 'raise_on_read', RuntimeError('chroma unreachable'))
+    body = client.get('/api/rag/sources?variant=general',
+                      headers=_auth(_token(client, DASHBOARD_PW))).get_json()
+    assert 'chroma unreachable' in body['live_error']
+    # Configured URLs are still listed, as not indexed.
+    assert body['sources'] and all(s['status'] == 'not_indexed' for s in body['sources'])
+
+
+def test_sources_endpoint_respects_token_scope(fb, client):
+    """The one dashboard password reaches both variants' sources; a narrower
+    token (should one ever be issued) is still confined to its variant."""
+    full = _auth(_token(client, DASHBOARD_PW))
+    assert client.get('/api/rag/sources?variant=general', headers=full).status_code == 200
+    assert client.get('/api/rag/sources?variant=postpartum', headers=full).status_code == 200
+
+    narrow = _auth(fb._make_dashboard_token({'postpartum'}))
+    assert client.get('/api/rag/sources?variant=postpartum', headers=narrow).status_code == 200
+    assert client.get('/api/rag/sources?variant=general', headers=narrow).status_code == 403
     assert client.get('/api/rag/sources?variant=general').status_code == 401

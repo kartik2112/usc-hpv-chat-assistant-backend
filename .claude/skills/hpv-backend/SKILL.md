@@ -25,7 +25,7 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 - `ALLOWED_ORIGINS` + `restrict_to_allowed_origins` — origin gate (requests without an Origin header pass).
 - `_request_variant()` — the variant for patient calls: the live session's wins, otherwise the validated `variant` field.
 - `_session_file_stem()`, `_migrate_legacy_session_files()`, `_variant_of()`.
-- `_DASHBOARD_PASSWORDS`, `_make_dashboard_token()`, `_dashboard_token_scope()`, `require_dashboard_token` (injects `variant=`).
+- `SESSIONS_PASSWORD_HASH`, `_make_dashboard_token()`, `_dashboard_token_scope()`, `require_dashboard_token` (injects `variant=`).
 - `generate_session_summary(messages, variant)`, `save_session_to_disk()`, `auto_expire_sessions()`.
 - `_rag_pipelines` — one pipeline per variant, built from `load_rag_sources()`; `daily_task()` re-reads the file and keeps the old pipeline for any variant that fails to rebuild.
 - Routes: `/api/chat` (SSE), `/api/audio-chat`, `/api/tts`, `/api/session/{start,activity,log,summary,end}`, `/api/sessions/auth`, `/api/sessions[/<file>]`, `/api/sessions/{favorite,delete,merge}`, `/api/rag/sources` (read-only sources viewer).
@@ -39,7 +39,7 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 ## RAG sources
 - `rag_sources.json` (path overridable with `RAG_SOURCES_FILE`) maps each variant to a Chroma target (`database`, `collection`, optional `api_key_env`/`tenant_env` for another Chroma account) and its web page / PDF URLs.
 - Two variants sharing a collection is rejected at load: each build deletes chunks for URLs outside its own list.
-- `HPVRAGPipeline` records `index_report` (per URL: status/chunks/kind), `removed_urls` and `built_at`; `/api/rag/sources` merges that with the current file so pending edits are visible.
+- `HPVRAGPipeline.describe_indexed_sources()` reads the collection's chunk metadata from Chroma (grouped by `source`) — that is what `/api/rag/sources` lists, so the viewer reflects Chroma, not the file. The file adds titles and the `not_indexed` / `not_in_config` flags; `index_report` (per URL: status/chunks/kind) and `built_at` describe the last crawl by this process.
 
 ## Storage layout
 ```
@@ -50,7 +50,7 @@ sessions/<variant>/session_<variant>_merged-<hex>_<UTCts>.*      # merges
 The JSON has `"variant"`, and the TXT header has a `Variant :` line. Files from before variants existed are moved once into `sessions/general/` at startup (idempotent). PHI-flagged messages are removed before writing to disk and before the summary LLM call.
 
 ## Dashboard auth
-- `SESSIONS_PASSWORD_HASH` unlocks **all** variants. The optional `SESSIONS_PASSWORD_HASH_<KEY>` (e.g. `_POSTPARTUM`) unlocks only that variant. Hashes are bcrypt. `SESSIONS_TOKEN_SECRET` signs tokens; if it's unset, a random secret is generated and tokens die on restart.
+- `SESSIONS_PASSWORD_HASH` (bcrypt) is the single dashboard password — it unlocks every variant and both dashboard pages. `SESSIONS_TOKEN_SECRET` signs tokens; if it's unset, a random secret is generated and tokens die on restart.
 - Token: `<expiry>.<sorted,keys>.<hmac>` (2 h). Every dashboard route takes `?variant=`, gets 403 if the variant is outside the token's scope, and only touches `variant.sessions_dir`, using the basename of the filename. Merges can't cross variants.
 - Auth is rate-limited per IP (5 failures → 15 min lockout, in memory).
 
@@ -58,4 +58,4 @@ The JSON has `"variant"`, and the TXT header has a `Variant :` line. Files from 
 Start → a heartbeat every ≤2 min (`/activity`) → `/log` events and a message snapshot (`messages_seq` guards against stale writes) → `/summary` (cached by message fingerprint) → `/end` (saves the files). There's also a tab-close beacon to `/end`, and a backstop that expires a session after 5 min idle (`session_cleanup` runs every minute).
 
 ## Offline smoke run
-`test_variants.py` shows the pattern: set `RENDER=1` and `OPENAI_API_KEY=x`, patch `rag_pipeline.build_rag_agent = lambda **kw: (None, None)` **before** `import flask_backend`, then stub `generate_session_summary` (and `ask_rag_question_stream` / `retrieve_context_docs` if you need `/api/chat`). Add `http://localhost:<port>` to `ALLOWED_ORIGINS` to drive it from a local frontend.
+`test_variants.py` shows the pattern: set `RENDER=1` and `OPENAI_API_KEY=x`, patch `rag_pipeline.build_rag_pipeline` with a fake pipeline class (see `conftest.FakePipeline`) **before** `import flask_backend`, then stub `generate_session_summary` (and `ask_rag_question_stream` / `retrieve_context_docs` if you need `/api/chat`). Add `http://localhost:<port>` to `ALLOWED_ORIGINS` to drive it from a local frontend.

@@ -747,28 +747,19 @@ def _session_file_stem(variant, session_id):
 
 
 # ── Sessions Dashboard Auth ───────────────────────────────────────────────────
-# Password hashes are stored as environment variables — never in source code.
-# To generate a hash for your chosen password run:
+# One password for the whole dashboard (both the sessions and the sources page,
+# and every variant). Its bcrypt hash is stored as an environment variable —
+# never in source code. To generate a hash for your chosen password run:
 #   python3 -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_PASSWORD', bcrypt.gensalt(rounds=12)).decode())"
 #
-#   SESSIONS_PASSWORD_HASH            unlocks EVERY variant (general + post-partum)
-#   SESSIONS_PASSWORD_HASH_<VARIANT>  optional; unlocks only that variant, e.g.
-#                                     SESSIONS_PASSWORD_HASH_POSTPARTUM for a team
-#                                     that should only see post-partum conversations
-#
-# The variants a password unlocks are signed into the token, and every
-# dashboard route checks the requested variant against that signed scope.
+# The variants a token grants are still signed into it and re-checked on every
+# dashboard route, so a provider cannot widen their access client-side.
 #
 # SESSIONS_TOKEN_SECRET is used to sign dashboard access tokens.
 # Set it to any long random string in Render's environment variables, e.g.:
 #   python3 -c "import secrets; print(secrets.token_hex(32))"
 # If not set, a random secret is generated at startup (tokens won't survive restarts).
-_DASHBOARD_PASSWORDS = [
-    (pw_hash, scope) for pw_hash, scope in
-    [(os.environ.get('SESSIONS_PASSWORD_HASH', ''), frozenset(VARIANTS))] +
-    [(os.environ.get(f'SESSIONS_PASSWORD_HASH_{key.upper()}', ''), frozenset({key})) for key in VARIANTS]
-    if pw_hash
-]
+SESSIONS_PASSWORD_HASH = os.environ.get('SESSIONS_PASSWORD_HASH', '')
 SESSIONS_TOKEN_SECRET  = os.environ.get('SESSIONS_TOKEN_SECRET', secrets.token_hex(32))
 SESSIONS_TOKEN_EXPIRY  = 7200   # 2 hours in seconds
 
@@ -1770,12 +1761,14 @@ def session_end():
 
 @app.route('/api/sessions/auth', methods=['POST', 'OPTIONS'])
 def sessions_auth():
-    """Validate the dashboard password and return a signed access token scoped
-    to the variants that password unlocks (see _DASHBOARD_PASSWORDS)."""
+    """Validate the dashboard password and return a signed access token.
+
+    The password unlocks every variant; the token carries that scope so the
+    dashboard routes can re-check it."""
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
 
-    if not _DASHBOARD_PASSWORDS:
+    if not SESSIONS_PASSWORD_HASH:
         return jsonify({'error': 'Sessions dashboard not configured — set SESSIONS_PASSWORD_HASH env var.'}), 503
 
     # ── IP-based rate limiting ────────────────────────────────────────────────
@@ -1792,16 +1785,13 @@ def sessions_auth():
     if not password:
         return jsonify({'error': 'Password required.'}), 400
 
-    scope = set()
     try:
-        for pw_hash, variant_keys in _DASHBOARD_PASSWORDS:
-            if bcrypt.checkpw(password.encode('utf-8'), pw_hash.encode('utf-8')):
-                scope |= variant_keys
+        valid = bcrypt.checkpw(password.encode('utf-8'), SESSIONS_PASSWORD_HASH.encode('utf-8'))
     except Exception as exc:
         logger.error(f"bcrypt error: {exc}")
         return jsonify({'error': 'Server password configuration error.'}), 500
 
-    if not scope:
+    if not valid:
         failures += 1
         lockout = (now + _AUTH_LOCKOUT_SECONDS) if failures >= _AUTH_MAX_FAILURES else 0
         _auth_rate_limit[ip] = (failures, lockout)
@@ -1813,9 +1803,9 @@ def sessions_auth():
 
     # ── Success — clear rate limit, issue token ───────────────────────────────
     _auth_rate_limit.pop(ip, None)
-    token = _make_dashboard_token(scope)
-    logger.info(f"Dashboard auth success from {ip} (variants: {sorted(scope)})")
-    return jsonify({'token': token, 'expires_in': SESSIONS_TOKEN_EXPIRY, 'variants': sorted(scope)}), 200
+    token = _make_dashboard_token(VARIANTS)
+    logger.info(f"Dashboard auth success from {ip}")
+    return jsonify({'token': token, 'expires_in': SESSIONS_TOKEN_EXPIRY, 'variants': sorted(VARIANTS)}), 200
 
 
 @app.route('/api/sessions', methods=['GET', 'OPTIONS'])
@@ -2258,48 +2248,68 @@ def merge_sessions(variant):
 @app.route('/api/rag/sources', methods=['GET', 'OPTIONS'])
 @require_dashboard_token
 def rag_sources_view(variant):
-    """Web pages and PDFs behind the variant's Chroma collection.
+    """What the variant's Chroma collection actually contains right now.
 
-    Combines what the live index was built from (status + chunk count per URL
-    from the last build) with the current rag_sources.json, so edits that the
-    next nightly refresh will apply show up as 'pending' / 'pending_removal'.
+    The rows come from **Chroma** (the metadata of the chunks in the collection),
+    not from rag_sources.json. The file is only consulted for two extras: the
+    optional titles, and which URLs are configured — so the page can flag a
+    source that is configured but has nothing indexed yet (added to the file, or
+    its last crawl failed), and one that is still indexed but no longer
+    configured (the next refresh drops it). If the file can't be read, the live
+    Chroma view is still returned.
+
     Never returns credentials or the names of the env vars that hold them.
     """
     pipeline = _rag_pipelines[variant.key]
-    report = pipeline.index_report
-    live = pipeline.rag_sources
+    live_error = None
+    try:
+        indexed = pipeline.describe_indexed_sources()
+    except Exception as exc:
+        logger.error(f"/api/rag/sources: could not read Chroma for '{variant.key}': {exc}")
+        indexed, live_error = {}, str(exc)
+
     config_error = None
     try:
         configured = load_rag_sources()[variant.key]
     except (OSError, ValueError) as exc:
-        configured, config_error = live, str(exc)
+        configured, config_error = None, str(exc)
 
-    def _row(source, status_if_unbuilt):
-        built = report.get(source.url)
-        return {
-            'url': source.url,
-            'title': source.title,
-            'status': built['status'] if built else status_if_unbuilt,
-            'chunks': built['chunks'] if built else 0,
-            'kind': built['kind'] if built else None,
-        }
+    titles = {s.url: s.title for s in configured.sources} if configured else {}
+    last_build = pipeline.index_report
 
-    configured_urls = set(configured.urls)
-    rows = [_row(s, 'pending') for s in configured.sources]
-    rows += [dict(_row(s, 'pending'), status='pending_removal')
-             for s in live.sources if s.url not in configured_urls]
+    rows = [{
+        'url': url,
+        'title': titles.get(url, ''),
+        'kind': row['kind'],
+        'chunks': row['chunks'],
+        # 'indexed' unless the file no longer lists it (unknown when unreadable).
+        'status': 'not_in_config' if (configured and url not in titles) else 'indexed',
+        'last_build': (last_build.get(url) or {}).get('status'),
+    } for url, row in sorted(indexed.items())]
+
+    # Configured, but nothing in the collection for it.
+    rows += [{
+        'url': url,
+        'title': title,
+        'kind': None,                      # never loaded, so the page guesses from the URL
+        'chunks': 0,
+        'status': 'not_indexed',
+        'last_build': (last_build.get(url) or {}).get('status'),
+    } for url, title in titles.items() if url not in indexed]
 
     def _target(t):
         return {'database': t.database, 'collection': t.collection}
 
     return jsonify({
         'variant': variant.key,
-        'chroma': _target(live.chroma),
-        'chroma_pending': _target(configured.chroma) if configured.chroma != live.chroma else None,
-        'built_at': pipeline.built_at,
+        'chroma': _target(pipeline.rag_sources.chroma),
+        'chroma_pending': (_target(configured.chroma)
+                           if configured and configured.chroma != pipeline.rag_sources.chroma else None),
+        'fetched_at': datetime.now(timezone.utc).isoformat(),   # when Chroma was read
+        'built_at': pipeline.built_at,                          # last refresh by this server
+        'live_error': live_error,
         'config_error': config_error,
         'sources': rows,
-        'removed': pipeline.removed_urls,
     }), 200
 
 
