@@ -23,7 +23,8 @@ import logging
 import bcrypt
 from flask_apscheduler import APScheduler
 
-from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream, retrieve_context_docs, build_system_prompt
+from rag_pipeline import build_rag_pipeline, ask_rag_question_stream, retrieve_context_docs, build_system_prompt
+from rag_sources import load_rag_sources
 import variants
 from variants import VARIANTS, DEFAULT_VARIANT, parse_variant
 
@@ -176,21 +177,35 @@ if not openai_api_key:
 
 client = OpenAI(api_key=openai_api_key)
 
-# The vector index is shared by every variant; the audience-specific prompt is
-# chosen per request (see _request_variant). The non-streaming agent below is
-# legacy and only used with the default variant's prompt.
-def _build_rag():
-    return build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS,
-                           audience_instructions=DEFAULT_VARIANT.audience_instructions)
+# One RAG pipeline per variant, each with its own Chroma collection and its own
+# web pages / PDFs, as listed in rag_sources.json (see rag_sources.py). Chat
+# requests retrieve from the pipeline of their variant (see _request_variant).
+def _build_rag_pipeline(sources):
+    return build_rag_pipeline(sources, openai_text_model=OPENAI_TEXT_MODEL,
+                              max_completion_tokens=MAX_COMPLETION_TOKENS)
 
-rag_agent, _rag_pipeline = _build_rag()
+# Startup fails loudly on a bad sources file or an unreachable vector store.
+_rag_pipelines = {key: _build_rag_pipeline(sources) for key, sources in load_rag_sources().items()}
 
 
 def daily_task():
-    """Nightly RAG refresh: re-crawl sources and rebuild the vector index."""
-    global rag_agent, _rag_pipeline
+    """Nightly RAG refresh: re-read rag_sources.json, then re-crawl each
+    variant's sources into its collection. A bad file or a failed rebuild is
+    logged and the previous pipeline keeps serving that variant."""
+    global _rag_pipelines
     print("Daily RAG Refresh task is running...")
-    rag_agent, _rag_pipeline = _build_rag()
+    try:
+        config = load_rag_sources()
+    except (OSError, ValueError) as exc:
+        logger.error(f"RAG refresh skipped — invalid rag_sources file: {exc}")
+        return
+    rebuilt = dict(_rag_pipelines)
+    for key, sources in config.items():
+        try:
+            rebuilt[key] = _build_rag_pipeline(sources)
+        except Exception as exc:
+            logger.error(f"RAG refresh failed for '{key}', keeping the previous index: {exc}")
+    _rag_pipelines = rebuilt
 
 # PHI detection engine — only loaded on sackend (not on Render).
 # presidio_analyzer + spaCy's en_core_web_md model consumes ~300 MB of RAM,
@@ -1298,10 +1313,11 @@ def chat():
     # references informed each answer. Retrieving here (instead of letting the
     # stream do it internally) guarantees the recorded references match exactly
     # what the model saw, without running the similarity search twice.
+    pipeline = _rag_pipelines[variant.key]   # this variant's own collection
     references = []
     retrieved_docs = []
     try:
-        retrieved_docs = retrieve_context_docs(_rag_pipeline, messages)
+        retrieved_docs = retrieve_context_docs(pipeline, messages)
         references = [
             {
                 "source": (doc.metadata or {}).get("source", ""),
@@ -1319,7 +1335,7 @@ def chat():
     def _rag_gen():
         try:
             full_response = ""
-            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs,
+            for token in ask_rag_question_stream(pipeline, messages, retrieved_docs=retrieved_docs,
                                                  survey_block=survey_block,
                                                  audience_instructions=variant.audience_instructions):
                 full_response += token
@@ -2232,6 +2248,58 @@ def merge_sessions(variant):
         'session_id': merged_id,
         'merged_from': payload.get('merged_from'),
         'summary': payload.get('summary'),
+    }), 200
+
+
+# ============================================================================
+# RAG SOURCES VIEWER  (read-only, dashboard token + variant scope)
+# ============================================================================
+
+@app.route('/api/rag/sources', methods=['GET', 'OPTIONS'])
+@require_dashboard_token
+def rag_sources_view(variant):
+    """Web pages and PDFs behind the variant's Chroma collection.
+
+    Combines what the live index was built from (status + chunk count per URL
+    from the last build) with the current rag_sources.json, so edits that the
+    next nightly refresh will apply show up as 'pending' / 'pending_removal'.
+    Never returns credentials or the names of the env vars that hold them.
+    """
+    pipeline = _rag_pipelines[variant.key]
+    report = pipeline.index_report
+    live = pipeline.rag_sources
+    config_error = None
+    try:
+        configured = load_rag_sources()[variant.key]
+    except (OSError, ValueError) as exc:
+        configured, config_error = live, str(exc)
+
+    def _row(source, status_if_unbuilt):
+        built = report.get(source.url)
+        return {
+            'url': source.url,
+            'title': source.title,
+            'status': built['status'] if built else status_if_unbuilt,
+            'chunks': built['chunks'] if built else 0,
+            'kind': built['kind'] if built else None,
+        }
+
+    configured_urls = set(configured.urls)
+    rows = [_row(s, 'pending') for s in configured.sources]
+    rows += [dict(_row(s, 'pending'), status='pending_removal')
+             for s in live.sources if s.url not in configured_urls]
+
+    def _target(t):
+        return {'database': t.database, 'collection': t.collection}
+
+    return jsonify({
+        'variant': variant.key,
+        'chroma': _target(live.chroma),
+        'chroma_pending': _target(configured.chroma) if configured.chroma != live.chroma else None,
+        'built_at': pipeline.built_at,
+        'config_error': config_error,
+        'sources': rows,
+        'removed': pipeline.removed_urls,
     }), 200
 
 

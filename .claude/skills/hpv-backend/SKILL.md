@@ -13,9 +13,11 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 | File | Role |
 |---|---|
 | `variants.py` | **Single source of truth for variants**: `Variant(key, label, audience_instructions, summary_context)`, `VARIANTS`, `DEFAULT_VARIANT`, `parse_variant()` |
-| `rag_pipeline.py` | `BASE_SYSTEM_RULES` + `build_system_prompt(audience_instructions)`, retrieval, `ask_rag_question_stream()` |
+| `rag_sources.json` / `rag_sources.py` | Per-variant Chroma target + source URLs, and the validating loader (`load_rag_sources()`) |
+| `rag_pipeline.py` | `BASE_SYSTEM_RULES` + `build_system_prompt(audience_instructions)`, `build_rag_pipeline(rag_sources)`, retrieval, `ask_rag_question_stream()` |
 | `flask_backend.py` | Routes, sessions, PHI detection, summaries, dashboard |
-| `test_variants.py` | Offline tests (stubbed RAG, PHI off) — `uv run pytest test_variants.py -v` |
+| `conftest.py` | Offline fixtures (`fb`, `client`, `FakePipeline`) shared by the test files below |
+| `test_variants.py`, `test_rag_sources.py` | Offline tests (stubbed RAG, PHI off) — `uv run pytest test_variants.py test_rag_sources.py -v` |
 | `test_phi_guardrails.py` | Needs the spaCy models **and** a real RAG build (network) — run it separately |
 
 ## flask_backend.py anchors (grep these)
@@ -25,13 +27,19 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 - `_session_file_stem()`, `_migrate_legacy_session_files()`, `_variant_of()`.
 - `_DASHBOARD_PASSWORDS`, `_make_dashboard_token()`, `_dashboard_token_scope()`, `require_dashboard_token` (injects `variant=`).
 - `generate_session_summary(messages, variant)`, `save_session_to_disk()`, `auto_expire_sessions()`.
-- Routes: `/api/chat` (SSE), `/api/audio-chat`, `/api/tts`, `/api/session/{start,activity,log,summary,end}`, `/api/sessions/auth`, `/api/sessions[/<file>]`, `/api/sessions/{favorite,delete,merge}`.
+- `_rag_pipelines` — one pipeline per variant, built from `load_rag_sources()`; `daily_task()` re-reads the file and keeps the old pipeline for any variant that fails to rebuild.
+- Routes: `/api/chat` (SSE), `/api/audio-chat`, `/api/tts`, `/api/session/{start,activity,log,summary,end}`, `/api/sessions/auth`, `/api/sessions[/<file>]`, `/api/sessions/{favorite,delete,merge}`, `/api/rag/sources` (read-only sources viewer).
 
 ## Variants
 - Keys are `general` and `postpartum`, and they must match `variants.js` in the frontend repo.
 - `/api/session/start {variant}` binds the variant to the session. After that, `/log`, `/summary`, `/end`, `/chat` and expiry all read it from the session, so the client cannot switch it. An unknown key gets a 400; a missing key means `general`.
 - Prompt = `BASE_SYSTEM_RULES` + `variant.audience_instructions` + the RAG context. General keeps the "assume age > 26" line; post-partum swaps it for post-partum framing. The summary prompt adds `variant.summary_context`.
 - **Adding a variant:** create a `Variant` in `variants.py` and add it to `VARIANTS`. Folders are created at startup, and nothing else in the backend needs to change. Then add it to the frontend's `variants.js`.
+
+## RAG sources
+- `rag_sources.json` (path overridable with `RAG_SOURCES_FILE`) maps each variant to a Chroma target (`database`, `collection`, optional `api_key_env`/`tenant_env` for another Chroma account) and its web page / PDF URLs.
+- Two variants sharing a collection is rejected at load: each build deletes chunks for URLs outside its own list.
+- `HPVRAGPipeline` records `index_report` (per URL: status/chunks/kind), `removed_urls` and `built_at`; `/api/rag/sources` merges that with the current file so pending edits are visible.
 
 ## Storage layout
 ```
