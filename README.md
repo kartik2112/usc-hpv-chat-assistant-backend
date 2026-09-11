@@ -11,6 +11,32 @@ Then add two environment variables in Render's dashboard / server:
 Key |	Value
 `SESSIONS_PASSWORD_HASH` |	`$2b$12$...` (output from step 1)
 `SESSIONS_TOKEN_SECRET` |	the hex string from step 2
+`SESSIONS_PASSWORD_HASH_POSTPARTUM` | *(optional)* a second bcrypt hash whose password opens **only** post-partum conversations
+
+`SESSIONS_PASSWORD_HASH` opens every conversation type (general + post-partum) and the
+dashboard offers a switch between them. Any `SESSIONS_PASSWORD_HASH_<VARIANT>` password is
+limited to that one type — the allowed types are signed into the dashboard token and
+re-checked by every dashboard endpoint.
+
+---
+
+## Variants: general vs post-partum
+
+The assistant has two audiences, defined once in `variants.py` (the frontend's
+`variants.js` must use the same keys):
+
+| Variant | Patient link | Saved to |
+|---|---|---|
+| `general` | `index.html?variant=general` | `sessions/general/session_general_<uuid>_<ts>.{json,txt}` |
+| `postpartum` | `index.html?variant=postpartum` | `sessions/postpartum/session_postpartum_<uuid>_<ts>.{json,txt}` |
+
+Without `?variant=` the patient page asks which one to use. The variant is fixed when the
+session starts (`/api/session/start`) and selects the audience lines of the system prompt
+and summary prompt. Saved files carry it in their name, in the JSON (`"variant"`) and in
+the TXT header. On first start, transcripts saved before variants existed are moved into
+`sessions/general/` automatically.
+
+Offline tests for this behaviour: `uv run pytest test_variants.py -v`.
 
 ---
 

@@ -23,7 +23,9 @@ import logging
 import bcrypt
 from flask_apscheduler import APScheduler
 
-from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream, retrieve_context_docs
+from rag_pipeline import ask_rag_question, build_rag_agent, ask_rag_question_stream, retrieve_context_docs, build_system_prompt
+import variants
+from variants import VARIANTS, DEFAULT_VARIANT, parse_variant
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -173,14 +175,22 @@ if not openai_api_key:
     raise ValueError("OPENAI_API_KEY environment variable is not set!")
 
 client = OpenAI(api_key=openai_api_key)
-rag_agent, _rag_pipeline = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
+
+# The vector index is shared by every variant; the audience-specific prompt is
+# chosen per request (see _request_variant). The non-streaming agent below is
+# legacy and only used with the default variant's prompt.
+def _build_rag():
+    return build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS,
+                           audience_instructions=DEFAULT_VARIANT.audience_instructions)
+
+rag_agent, _rag_pipeline = _build_rag()
 
 
 def daily_task():
-    """Your daily logic goes here (e.g., making an API call, cleaning up data)"""
+    """Nightly RAG refresh: re-crawl sources and rebuild the vector index."""
     global rag_agent, _rag_pipeline
     print("Daily RAG Refresh task is running...")
-    rag_agent, _rag_pipeline = build_rag_agent(openai_text_model=OPENAI_TEXT_MODEL, max_completion_tokens=MAX_COMPLETION_TOKENS)
+    rag_agent, _rag_pipeline = _build_rag()
 
 # PHI detection engine — only loaded on sackend (not on Render).
 # presidio_analyzer + spaCy's en_core_web_md model consumes ~300 MB of RAM,
@@ -649,7 +659,11 @@ if PHI_ENABLED:
 # SESSION MANAGEMENT
 # ============================================================================
 
-SESSIONS_DIR = 'sessions'
+# Saved transcripts live in one folder per variant, all at the same depth:
+#   sessions/general/session_general_<uuid>_<ts>.{json,txt}
+#   sessions/postpartum/session_postpartum_<uuid>_<ts>.{json,txt}
+# Folder paths come only from the VARIANTS registry, never from client input.
+#
 # Server-side inactivity timeout. Lowered from 60 → 5 minutes now that the
 # frontend (a) keeps active sessions alive with a throttled activity heartbeat
 # and (b) ends sessions immediately on tab close via navigator.sendBeacon.
@@ -658,22 +672,88 @@ SESSIONS_DIR = 'sessions'
 # so abandoned conversations surface in the dashboard within ~5 minutes instead
 # of an hour.
 SESSION_TIMEOUT_MINUTES = 5
-os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-sessions = {}          # { session_id: { events, messages, last_activity, created_at } }
+
+def _migrate_legacy_session_files():
+    """Move pre-variant transcripts (sessions/session_<uuid>_<ts>.*) into the
+    general folder under the session_general_... name. Every conversation saved
+    before variants existed was a general-HPV one. Idempotent: only top-level
+    files are touched and an existing target is never overwritten."""
+    legacy = DEFAULT_VARIANT
+    for fname in os.listdir(variants.SESSIONS_ROOT):
+        src = os.path.join(variants.SESSIONS_ROOT, fname)
+        if not (fname.startswith('session_') and fname.endswith(('.json', '.txt'))
+                and os.path.isfile(src)):
+            continue
+        dst = os.path.join(legacy.sessions_dir, fname.replace('session_', f'session_{legacy.key}_', 1))
+        if not os.path.exists(dst):
+            os.replace(src, dst)
+            logger.info(f"Migrated legacy session file {fname} → {dst}")
+
+
+for _v in VARIANTS.values():
+    os.makedirs(_v.sessions_dir, exist_ok=True)
+_migrate_legacy_session_files()
+
+sessions = {}          # { session_id: { variant, events, messages, last_activity, created_at } }
 sessions_lock = threading.Lock()
 
+
+def _variant_of(session_data):
+    """The Variant a live or saved session belongs to (files saved before
+    variants existed carry no tag and are general)."""
+    return VARIANTS.get(session_data.get('variant'), DEFAULT_VARIANT)
+
+
+def _request_variant(data):
+    """Variant for a patient-facing request.
+
+    A live session's variant is bound at /api/session/start and wins, so a
+    client cannot switch audience mid-conversation. Otherwise the request's
+    'variant' field is validated against the registry. Returns None for an
+    unknown key so the caller can answer 400.
+    """
+    session_id = data.get('session_id')
+    if isinstance(session_id, str):
+        with sessions_lock:
+            live = sessions.get(session_id)
+        if live:
+            return _variant_of(live)
+    return parse_variant(data.get('variant'))
+
+
+def _session_file_stem(variant, session_id):
+    """sessions/<variant>/session_<variant>_<session_id>_<utc timestamp>.
+
+    The variant tag in the name keeps a file self-describing even if it is
+    copied out of its folder."""
+    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    return os.path.join(variant.sessions_dir, f"session_{variant.key}_{session_id}_{timestamp}")
+
+
 # ── Sessions Dashboard Auth ───────────────────────────────────────────────────
-# Password hash is stored as an environment variable — never in source code.
+# Password hashes are stored as environment variables — never in source code.
 # To generate a hash for your chosen password run:
 #   python3 -c "import bcrypt; print(bcrypt.hashpw(b'YOUR_PASSWORD', bcrypt.gensalt(rounds=12)).decode())"
-# Then set SESSIONS_PASSWORD_HASH=<output> in Render's environment variables.
+#
+#   SESSIONS_PASSWORD_HASH            unlocks EVERY variant (general + post-partum)
+#   SESSIONS_PASSWORD_HASH_<VARIANT>  optional; unlocks only that variant, e.g.
+#                                     SESSIONS_PASSWORD_HASH_POSTPARTUM for a team
+#                                     that should only see post-partum conversations
+#
+# The variants a password unlocks are signed into the token, and every
+# dashboard route checks the requested variant against that signed scope.
 #
 # SESSIONS_TOKEN_SECRET is used to sign dashboard access tokens.
 # Set it to any long random string in Render's environment variables, e.g.:
 #   python3 -c "import secrets; print(secrets.token_hex(32))"
 # If not set, a random secret is generated at startup (tokens won't survive restarts).
-SESSIONS_PASSWORD_HASH = os.environ.get('SESSIONS_PASSWORD_HASH', '')
+_DASHBOARD_PASSWORDS = [
+    (pw_hash, scope) for pw_hash, scope in
+    [(os.environ.get('SESSIONS_PASSWORD_HASH', ''), frozenset(VARIANTS))] +
+    [(os.environ.get(f'SESSIONS_PASSWORD_HASH_{key.upper()}', ''), frozenset({key})) for key in VARIANTS]
+    if pw_hash
+]
 SESSIONS_TOKEN_SECRET  = os.environ.get('SESSIONS_TOKEN_SECRET', secrets.token_hex(32))
 SESSIONS_TOKEN_EXPIRY  = 7200   # 2 hours in seconds
 
@@ -683,40 +763,49 @@ _AUTH_MAX_FAILURES = 5
 _AUTH_LOCKOUT_SECONDS = 900   # 15 minutes
 
 
-def _make_dashboard_token() -> str:
-    """Return a signed, expiring token for dashboard access."""
-    expiry = str(int(time.time()) + SESSIONS_TOKEN_EXPIRY)
-    sig = hmac.new(SESSIONS_TOKEN_SECRET.encode(), expiry.encode(), hashlib.sha256).hexdigest()
-    return f"{expiry}.{sig}"
+def _sign(payload: str) -> str:
+    return hmac.new(SESSIONS_TOKEN_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()
 
 
-def _validate_dashboard_token(token: str) -> bool:
-    """Return True iff the token is unexpired and its HMAC is valid."""
-    if not token:
-        return False
+def _make_dashboard_token(variant_keys) -> str:
+    """Return a signed, expiring token: '<expiry>.<variant,keys>.<hmac>'."""
+    payload = f"{int(time.time()) + SESSIONS_TOKEN_EXPIRY}.{','.join(sorted(variant_keys))}"
+    return f"{payload}.{_sign(payload)}"
+
+
+def _dashboard_token_scope(token: str) -> set:
+    """Return the variant keys a valid, unexpired token grants (empty set if invalid)."""
     try:
-        expiry_str, sig = token.rsplit('.', 1)
+        expiry_str, scope, sig = token.split('.')
         expiry = int(expiry_str)
     except (ValueError, AttributeError):
-        return False
-    if expiry < int(time.time()):
-        return False
-    expected = hmac.new(SESSIONS_TOKEN_SECRET.encode(), expiry_str.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(sig, expected)
+        return set()
+    if expiry < int(time.time()) or not hmac.compare_digest(sig, _sign(f"{expiry_str}.{scope}")):
+        return set()
+    return set(scope.split(',')) & VARIANTS.keys()
 
 
 def require_dashboard_token(f):
-    """Decorator: reject requests that don't carry a valid dashboard token.
-    OPTIONS preflights are always passed through so CORS handshakes work."""
+    """Decorator for dashboard routes.
+
+    Requires a valid token whose signed scope covers the requested variant
+    (?variant=<key>, default general) and passes the resolved Variant to the
+    view as `variant`. OPTIONS preflights are answered here so CORS works.
+    """
     @wraps(f)
     def decorated(*args, **kwargs):
         if request.method == 'OPTIONS':
-            return f(*args, **kwargs)   # let the route handle the preflight
-        auth_header = request.headers.get('Authorization', '')
-        token = auth_header.removeprefix('Bearer ').strip()
-        if not _validate_dashboard_token(token):
+            return jsonify({'status': 'ok'}), 200
+        token = request.headers.get('Authorization', '').removeprefix('Bearer ').strip()
+        scope = _dashboard_token_scope(token)
+        if not scope:
             return jsonify({'error': 'Unauthorized. Please authenticate.'}), 401
-        return f(*args, **kwargs)
+        variant = parse_variant(request.args.get('variant'))
+        if variant is None:
+            return jsonify({'error': 'Unknown variant.'}), 400
+        if variant.key not in scope:
+            return jsonify({'error': f'Your access does not include {variant.label} conversations.'}), 403
+        return f(*args, variant=variant, **kwargs)
     return decorated
 
 
@@ -737,13 +826,15 @@ def _messages_fingerprint(messages):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def generate_session_summary(messages):
+def generate_session_summary(messages, variant=DEFAULT_VARIANT):
     """Call the LLM to produce a patient-questions + doctor-action-items summary.
 
     PHI-flagged messages are stripped before sending to the LLM as a
     defence-in-depth measure (the frontend should not store them in the
-    session at all, but we filter here too to be safe).
+    session at all, but we filter here too to be safe). `variant` adds its
+    audience context (e.g. post-partum) to the summary prompt.
     """
+    response = None
     try:
         if not messages:
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
@@ -764,7 +855,9 @@ def generate_session_summary(messages):
             {
                 "role": "system",
                 "content": (
-                    "You are a clinical documentation assistant. Given a patient–assistant "
+                    "You are a clinical documentation assistant. "
+                    + (f"{variant.summary_context} " if variant.summary_context else "") +
+                    "Given a patient–assistant "
                     "conversation about HPV, produce a concise JSON summary with exactly two fields:\n"
                     "1. 'patient_questions': A bullet-point list of the main questions and concerns "
                     "raised by the patient. (ONLY CAPTURE QUESTIONS ASKED BY THE USER IN THE JSON. DO NO HALLUCINATE. DO NOT ADD ANY ADDITIONAL QUESTIONS)\n"
@@ -922,8 +1015,9 @@ _FEEDBACK_TXT_LABELS = [
 ]
 
 def save_session_to_disk(session_id, session_data, summary, feedback_override=None):
-    """Write session JSON and a human-readable TXT transcript to the sessions/ folder."""
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    """Write session JSON and a human-readable TXT transcript to the variant's folder."""
+    variant   = _variant_of(session_data)
+    stem      = _session_file_stem(variant, session_id)
     ended_at  = datetime.utcnow()
     created_at = session_data["created_at"]
 
@@ -958,9 +1052,10 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
             feedback[key] = value.strip()
 
     # ── JSON ──────────────────────────────────────────────────────────────────
-    json_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.json")
+    json_filename = f"{stem}.json"
     payload = {
         "session_id":  session_id,
+        "variant":     variant.key,
         "created_at":  created_at.isoformat(),
         "ended_at":    ended_at.isoformat(),
         "text_model":  TEXT_MODEL_LABEL,
@@ -975,7 +1070,7 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
         json.dump(payload, f, indent=2)
 
     # ── TXT ───────────────────────────────────────────────────────────────────
-    txt_filename = os.path.join(SESSIONS_DIR, f"session_{session_id}_{timestamp}.txt")
+    txt_filename = f"{stem}.txt"
 
     duration_secs = int((ended_at - created_at).total_seconds())
     duration_str  = f"{duration_secs // 60}m {duration_secs % 60}s"
@@ -983,6 +1078,7 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
     lines = [
         "HPV Health Assistant — Session Transcript",
         "=" * 60,
+        f"Variant    : {variant.label} ({variant.key})",
         f"Session ID : {session_id}",
         f"Started    : {created_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
         f"Ended      : {ended_at.strftime('%Y-%m-%d %H:%M:%S')} UTC",
@@ -1096,7 +1192,7 @@ def auto_expire_sessions():
                 summary = cached['summary']
                 logger.info(f"Session {sid}: reusing cached summary on expiry.")
             else:
-                summary = generate_session_summary(messages)
+                summary = generate_session_summary(messages, _variant_of(session_data))
             save_session_to_disk(sid, session_data, summary)
             logger.info(f"Auto-expired session {sid}")
 
@@ -1115,7 +1211,10 @@ def chat():
     Streaming proxy endpoint for RAG-powered chat completions.
 
     Accepts the same JSON payload as before:
-        { "messages": [...], "language": "en"|"es", ... }
+        { "messages": [...], "language": "en"|"es", "session_id": "...",
+          "variant": "general"|"postpartum", ... }
+    The variant (audience prompt) comes from the live session when session_id
+    is known, else from the validated 'variant' field — see _request_variant.
 
     Returns a Server-Sent Events (text/event-stream) response so the
     frontend can render tokens as they arrive.  Each SSE event carries a
@@ -1138,6 +1237,10 @@ def chat():
         return jsonify({"error": "Missing 'messages' field in request"}), 400
 
     messages = data.get("messages", [])
+
+    variant = _request_variant(data)
+    if variant is None:
+        return jsonify({"error": "Unknown variant"}), 400
 
     # Language sent by the client ("en" or "es"). Used to select the
     # correct spaCy model inside detect_phi_backend().
@@ -1216,7 +1319,9 @@ def chat():
     def _rag_gen():
         try:
             full_response = ""
-            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs, survey_block=survey_block):
+            for token in ask_rag_question_stream(_rag_pipeline, messages, retrieved_docs=retrieved_docs,
+                                                 survey_block=survey_block,
+                                                 audience_instructions=variant.audience_instructions):
                 full_response += token
                 yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
 
@@ -1324,6 +1429,10 @@ def audio_chat():
         language = data.get('language', 'en')
         chat_history = data.get('chat_history', [])
 
+        variant = _request_variant(data)
+        if variant is None:
+            return jsonify({'error': 'Unknown variant'}), 400
+
         # Pre-chat questionnaire answers (optional) → appended to the system prompt.
         survey_block = format_survey_block(sanitize_survey_responses(data.get('survey_responses')))
 
@@ -1333,7 +1442,9 @@ def audio_chat():
         voice_option = 'echo' if language == 'en' else 'onyx'
 
         # Build messages for gpt-4o-audio-preview
-        messages = [{'role': 'system', 'content': SYSTEM_MESSAGE + survey_block}]
+        messages = [{'role': 'system',
+                     'content': build_system_prompt(variant.audience_instructions,
+                                                    with_context_header=False) + survey_block}]
 
         # Add recent chat history (limit to last 10)
         if chat_history:
@@ -1444,6 +1555,12 @@ def session_start():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
     data = request.get_json(silent=True) or {}
+    # The variant is bound to the session here and never changes afterwards:
+    # later /log, /summary, /end and /chat calls read it from the session, so
+    # the folder a transcript is saved to cannot be switched by the client.
+    variant = parse_variant(data.get('variant'))
+    if variant is None:
+        return jsonify({'error': 'Unknown variant'}), 400
     # Pre-chat questionnaire answers (optional) — stored on the session so they
     # are persisted to disk and shown in the sessions dashboard.
     survey_responses = sanitize_survey_responses(data.get('survey_responses'))
@@ -1451,6 +1568,7 @@ def session_start():
     now = datetime.utcnow()
     with sessions_lock:
         sessions[session_id] = {
+            'variant': variant.key,
             'events': [],
             'messages': [],
             'survey_responses': survey_responses,
@@ -1458,8 +1576,8 @@ def session_start():
             'last_activity': now,
             'created_at': now
         }
-    logger.info(f"Session started: {session_id} (survey items: {len(survey_responses)})")
-    return jsonify({'session_id': session_id}), 200
+    logger.info(f"Session started: {session_id} (variant: {variant.key}, survey items: {len(survey_responses)})")
+    return jsonify({'session_id': session_id, 'variant': variant.key}), 200
 
 
 @app.route('/api/session/activity', methods=['POST', 'OPTIONS'])
@@ -1562,11 +1680,12 @@ def session_summary():
         cached = session_data.get('summary_cache')
         if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
             return jsonify({'status': 'cached', 'summary': cached['summary']}), 200
+        variant = _variant_of(session_data)
 
     # The LLM call happens OUTSIDE sessions_lock deliberately. Holding a global
     # lock across a multi-second completion would stall every other session's
     # /log, /activity and /chat.
-    summary = generate_session_summary(effective_messages)
+    summary = generate_session_summary(effective_messages, variant)
 
     with sessions_lock:
         sd = sessions.get(session_id)
@@ -1625,7 +1744,7 @@ def session_end():
         summary = cached['summary']
         logger.info(f"Session {session_id}: reusing cached summary.")
     else:
-        summary = generate_session_summary(effective_messages)
+        summary = generate_session_summary(effective_messages, _variant_of(session_data))
 
     filename = save_session_to_disk(session_id, session_data, summary,
                                     feedback_override=feedback_payload)
@@ -1635,11 +1754,12 @@ def session_end():
 
 @app.route('/api/sessions/auth', methods=['POST', 'OPTIONS'])
 def sessions_auth():
-    """Validate the dashboard password and return a signed access token."""
+    """Validate the dashboard password and return a signed access token scoped
+    to the variants that password unlocks (see _DASHBOARD_PASSWORDS)."""
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
 
-    if not SESSIONS_PASSWORD_HASH:
+    if not _DASHBOARD_PASSWORDS:
         return jsonify({'error': 'Sessions dashboard not configured — set SESSIONS_PASSWORD_HASH env var.'}), 503
 
     # ── IP-based rate limiting ────────────────────────────────────────────────
@@ -1656,13 +1776,16 @@ def sessions_auth():
     if not password:
         return jsonify({'error': 'Password required.'}), 400
 
+    scope = set()
     try:
-        valid = bcrypt.checkpw(password.encode('utf-8'), SESSIONS_PASSWORD_HASH.encode('utf-8'))
+        for pw_hash, variant_keys in _DASHBOARD_PASSWORDS:
+            if bcrypt.checkpw(password.encode('utf-8'), pw_hash.encode('utf-8')):
+                scope |= variant_keys
     except Exception as exc:
         logger.error(f"bcrypt error: {exc}")
         return jsonify({'error': 'Server password configuration error.'}), 500
 
-    if not valid:
+    if not scope:
         failures += 1
         lockout = (now + _AUTH_LOCKOUT_SECONDS) if failures >= _AUTH_MAX_FAILURES else 0
         _auth_rate_limit[ip] = (failures, lockout)
@@ -1674,25 +1797,23 @@ def sessions_auth():
 
     # ── Success — clear rate limit, issue token ───────────────────────────────
     _auth_rate_limit.pop(ip, None)
-    token = _make_dashboard_token()
-    logger.info(f"Dashboard auth success from {ip}")
-    return jsonify({'token': token, 'expires_in': SESSIONS_TOKEN_EXPIRY}), 200
+    token = _make_dashboard_token(scope)
+    logger.info(f"Dashboard auth success from {ip} (variants: {sorted(scope)})")
+    return jsonify({'token': token, 'expires_in': SESSIONS_TOKEN_EXPIRY, 'variants': sorted(scope)}), 200
 
 
 @app.route('/api/sessions', methods=['GET', 'OPTIONS'])
 @require_dashboard_token
-def list_sessions():
-    """Return metadata for all saved session files, newest first."""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
+def list_sessions(variant):
+    """Return metadata for the variant's saved session files, newest first."""
     try:
         # Load all session JSON files — sort order is applied after reading
         # so we can sort by the actual created_at ISO timestamp stored inside
         # each file (sorting by filename would sort by UUID, not by time).
-        files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith('.json')]
+        files = [f for f in os.listdir(variant.sessions_dir) if f.endswith('.json')]
         result = []
         for fname in files:
-            fpath = os.path.join(SESSIONS_DIR, fname)
+            fpath = os.path.join(variant.sessions_dir, fname)
             with open(fpath, 'r') as fp:
                 data = json.load(fp)
             # Backward-compat: fall back to event reconstruction for old files
@@ -1725,7 +1846,7 @@ def list_sessions():
             key=lambda s: s['created_at'] or '',
             reverse=True
         )
-        return jsonify({'sessions': result, 'total': len(result)}), 200
+        return jsonify({'sessions': result, 'total': len(result), 'variant': variant.key}), 200
     except Exception as e:
         logger.error(f"Error listing sessions: {e}")
         return jsonify({'error': str(e)}), 500
@@ -1733,19 +1854,17 @@ def list_sessions():
 
 @app.route('/api/sessions/<path:filename>', methods=['GET', 'OPTIONS'])
 @require_dashboard_token
-def get_session_detail(filename):
+def get_session_detail(filename, variant):
     """Return the full detail of a single saved session file."""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
-    safe_name = os.path.basename(filename)          # prevent path traversal
-    if not safe_name.endswith('.json'):
+    safe_name, fpath = _safe_session_path(filename, variant)
+    if not safe_name:
         return jsonify({'error': 'Invalid filename'}), 400
-    fpath = os.path.join(SESSIONS_DIR, safe_name)
     if not os.path.exists(fpath):
         return jsonify({'error': 'Session not found'}), 404
     try:
         with open(fpath, 'r') as fp:
             data = json.load(fp)
+        data.setdefault('variant', variant.key)   # files saved before variants existed
 
         # Backward-compat: session files saved before the message-sync fix
         # may have an empty (or missing) messages array even though the events
@@ -1775,11 +1894,12 @@ def get_session_detail(filename):
 # ============================================================================
 # These endpoints let the provider dashboard persist favorite flags, bulk-delete
 # sessions, and merge 2–3 sessions into a single combined session.  All three
-# are token-protected and path-traversal safe (filenames are reduced to their
-# basename and required to end in .json before any filesystem access).
+# are token-protected, confined to the token-authorised variant's folder, and
+# path-traversal safe (filenames are reduced to their basename and required to
+# end in .json before any filesystem access).
 
-def _safe_session_path(filename):
-    """Return (safe_basename, abs_json_path) for a session file, or (None, None).
+def _safe_session_path(filename, variant):
+    """Return (safe_basename, json_path) inside the variant's folder, or (None, None).
 
     Strips any directory component (path-traversal guard) and rejects names
     that don't end in .json.  Does NOT check existence — callers do that.
@@ -1789,7 +1909,7 @@ def _safe_session_path(filename):
     safe = os.path.basename(filename)
     if not safe.endswith('.json'):
         return None, None
-    return safe, os.path.join(SESSIONS_DIR, safe)
+    return safe, os.path.join(variant.sessions_dir, safe)
 
 
 def _delete_session_files(json_path):
@@ -1821,12 +1941,10 @@ def _parse_session_iso(value):
 
 @app.route('/api/sessions/favorite', methods=['POST', 'OPTIONS'])
 @require_dashboard_token
-def set_session_favorite():
+def set_session_favorite(variant):
     """Set or clear the favorite flag on a single session file (persisted to disk)."""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
     body = request.get_json(silent=True) or {}
-    safe, fpath = _safe_session_path(body.get('filename'))
+    safe, fpath = _safe_session_path(body.get('filename'), variant)
     favorite = bool(body.get('favorite', False))
     if not safe:
         return jsonify({'error': 'Invalid filename'}), 400
@@ -1847,17 +1965,15 @@ def set_session_favorite():
 
 @app.route('/api/sessions/delete', methods=['POST', 'OPTIONS'])
 @require_dashboard_token
-def delete_sessions():
+def delete_sessions(variant):
     """Bulk-delete one or more session files (each .json + paired .txt)."""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
     body = request.get_json(silent=True) or {}
     filenames = body.get('filenames')
     if not isinstance(filenames, list) or not filenames:
         return jsonify({'error': 'filenames must be a non-empty list'}), 400
     deleted, errors = [], []
     for fn in filenames:
-        safe, fpath = _safe_session_path(fn)
+        safe, fpath = _safe_session_path(fn, variant)
         if not safe:
             errors.append({'filename': str(fn), 'error': 'invalid filename'})
             continue
@@ -1881,8 +1997,8 @@ def _lang_label(code):
     return 'Español' if code == 'es' else 'English'
 
 
-def _build_merged_session(loaded):
-    """Combine 2–3 loaded sessions [(filename, data), ...] into one payload.
+def _build_merged_session(loaded, variant):
+    """Combine 2–3 loaded sessions [(filename, data), ...] of one variant into one payload.
 
     Implements the confirmed merge logic:
       • sources ordered oldest → newest by created_at
@@ -1956,7 +2072,7 @@ def _build_merged_session(loaded):
     audio_model = ', '.join(audio_models) if audio_models else AUDIO_MODEL_LABEL
 
     # Regenerate a single coherent summary from the merged conversation.
-    summary = generate_session_summary(merged_messages)
+    summary = generate_session_summary(merged_messages, variant)
 
     created_at = min((d.get('created_at') or '' for _s, d in ordered), default='')
     ended_at = max((d.get('ended_at') or '' for _s, d in ordered), default='')
@@ -1964,6 +2080,7 @@ def _build_merged_session(loaded):
     merged_id = 'merged-' + uuid.uuid4().hex[:12]
     payload = {
         'session_id': merged_id,
+        'variant': variant.key,
         'created_at': created_at,
         'ended_at': ended_at,
         'text_model': text_model,
@@ -1980,10 +2097,9 @@ def _build_merged_session(loaded):
     return merged_id, payload
 
 
-def _write_merged_session_files(merged_id, payload):
+def _write_merged_session_files(merged_id, payload, variant):
     """Persist a merged session as both .json and a human-readable .txt."""
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    json_filename = os.path.join(SESSIONS_DIR, f"session_{merged_id}_{timestamp}.json")
+    json_filename = f"{_session_file_stem(variant, merged_id)}.json"
     with open(json_filename, 'w') as f:
         json.dump(payload, f, indent=2)
 
@@ -1999,6 +2115,7 @@ def _write_merged_session_files(merged_id, payload):
     lines = [
         "HPV Health Assistant — MERGED Session Transcript",
         "=" * 60,
+        f"Variant           : {variant.label} ({variant.key})",
         f"Merged Session ID : {merged_id}",
         f"Merged From       : {', '.join(payload.get('merged_from') or [])}",
         f"Started           : {payload.get('created_at', '—')} UTC",
@@ -2065,10 +2182,11 @@ def _write_merged_session_files(merged_id, payload):
 
 @app.route('/api/sessions/merge', methods=['POST', 'OPTIONS'])
 @require_dashboard_token
-def merge_sessions():
-    """Merge 2–3 sessions into one combined session, then delete the originals."""
-    if request.method == 'OPTIONS':
-        return jsonify({'status': 'ok'}), 200
+def merge_sessions(variant):
+    """Merge 2–3 sessions of one variant into one combined session, then delete the originals.
+
+    Sources are only ever read from the variant's own folder, so general and
+    post-partum conversations can never be merged together."""
     body = request.get_json(silent=True) or {}
     filenames = body.get('filenames')
     if not isinstance(filenames, list) or not (2 <= len(filenames) <= 3):
@@ -2078,7 +2196,7 @@ def merge_sessions():
     loaded = []
     seen = set()
     for fn in filenames:
-        safe, fpath = _safe_session_path(fn)
+        safe, fpath = _safe_session_path(fn, variant)
         if not safe:
             return jsonify({'error': f'Invalid filename: {fn}'}), 400
         if safe in seen:
@@ -2093,8 +2211,8 @@ def merge_sessions():
             return jsonify({'error': f'Could not read {safe}: {e}'}), 500
 
     try:
-        merged_id, payload = _build_merged_session(loaded)
-        merged_json = _write_merged_session_files(merged_id, payload)
+        merged_id, payload = _build_merged_session(loaded, variant)
+        merged_json = _write_merged_session_files(merged_id, payload, variant)
     except Exception as e:
         logger.error(f"Merge failed: {e}")
         return jsonify({'error': str(e)}), 500
@@ -2102,7 +2220,7 @@ def merge_sessions():
     # Merge succeeded → delete the originals (confirmed behaviour).
     for safe, _data in loaded:
         try:
-            _delete_session_files(os.path.join(SESSIONS_DIR, safe))
+            _delete_session_files(os.path.join(variant.sessions_dir, safe))
         except Exception as e:
             logger.warning(f"Could not delete source {safe} after merge: {e}")
 
