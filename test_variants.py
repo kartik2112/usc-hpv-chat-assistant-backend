@@ -4,8 +4,7 @@ test_variants.py
 General vs post-partum variant behaviour: prompt selection, per-variant session
 folders/filenames, the session↔variant binding, and dashboard token scoping.
 
-Runs offline — the RAG index build is stubbed and PHI detection is disabled
-(RENDER=1), so no OpenAI / Chroma / spaCy access is needed:
+Runs offline (see conftest.py for the fixtures):
 
     uv run pytest test_variants.py -v
 
@@ -14,68 +13,12 @@ enabled and a real RAG build, which this file deliberately avoids.
 """
 
 import glob
-import importlib
 import json
 import os
-import sys
 
-import bcrypt
 import pytest
 
-MASTER_PW = 'master-pw'
-POSTPARTUM_PW = 'pp-only-pw'
-LEGACY_FILE = 'session_11111111-legacy_20250101_000000.json'
-
-
-def _hash(pw):
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt(rounds=4)).decode()
-
-
-@pytest.fixture(scope='module')
-def fb(tmp_path_factory):
-    """Import flask_backend inside a temp working dir with offline stubs."""
-    workdir = tmp_path_factory.mktemp('backend')
-    os.makedirs(workdir / 'sessions')
-    (workdir / 'sessions' / LEGACY_FILE).write_text(json.dumps({'session_id': 'legacy'}))
-
-    old_cwd, old_env = os.getcwd(), dict(os.environ)
-    os.chdir(workdir)
-    os.environ.update({
-        'RENDER': '1',                     # PHI_ENABLED=False → no spaCy
-        'OPENAI_API_KEY': 'test-key',
-        'SESSIONS_TOKEN_SECRET': 'test-secret',
-        'SESSIONS_PASSWORD_HASH': _hash(MASTER_PW),
-        'SESSIONS_PASSWORD_HASH_POSTPARTUM': _hash(POSTPARTUM_PW),
-    })
-    import rag_pipeline
-    real_build = rag_pipeline.build_rag_agent
-    rag_pipeline.build_rag_agent = lambda **kwargs: (None, None)   # no crawling / Chroma
-    sys.modules.pop('flask_backend', None)
-    module = importlib.import_module('flask_backend')
-    module.generate_session_summary = lambda messages, variant=None: {
-        'patient_questions': f'• asked ({variant.key})', 'action_items': ''}
-    yield module
-    module.scheduler.shutdown(wait=False)
-    rag_pipeline.build_rag_agent = real_build
-    sys.modules.pop('flask_backend', None)
-    os.chdir(old_cwd)
-    os.environ.clear()
-    os.environ.update(old_env)
-
-
-@pytest.fixture
-def client(fb):
-    return fb.app.test_client()
-
-
-def _token(client, password):
-    resp = client.post('/api/sessions/auth', json={'password': password})
-    assert resp.status_code == 200, resp.get_json()
-    return resp.get_json()['token']
-
-
-def _auth(token):
-    return {'Authorization': f'Bearer {token}'}
+from conftest import LEGACY_FILE, MASTER_PW, POSTPARTUM_PW, auth_header as _auth, token_for as _token
 
 
 def _run_conversation(client, variant):
