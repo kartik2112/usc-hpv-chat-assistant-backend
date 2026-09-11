@@ -1475,11 +1475,23 @@ def session_activity():
     return jsonify({'status': 'ok'}), 200
 
 
+def _beacon_json():
+    """JSON body of a request that may come from navigator.sendBeacon.
+
+    The frontend sends its tab-close / tab-hidden beacons as text/plain, since a
+    cross-origin application/json beacon needs a CORS preflight that the
+    closing page never gets to follow up. Parse the body as JSON whatever the
+    Content-Type; a malformed body yields {} (then 404 as an unknown session).
+    """
+    data = request.get_json(force=True, silent=True)
+    return data if isinstance(data, dict) else {}
+
+
 @app.route('/api/session/log', methods=['POST', 'OPTIONS'])
 def session_log():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
-    data = request.get_json() or {}
+    data = _beacon_json()
     session_id = data.get('session_id')
     event = data.get('event')          # single event object (optional)
     messages = data.get('messages')    # full messages array (optional)
@@ -1581,7 +1593,7 @@ def session_summary():
 def session_end():
     if request.method == 'OPTIONS':
         return jsonify({'status': 'ok'}), 200
-    data = request.get_json() or {}
+    data = _beacon_json()
     session_id = data.get('session_id')
     # Allow caller to push a final messages snapshot
     final_messages = data.get('messages')
