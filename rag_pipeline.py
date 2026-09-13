@@ -55,6 +55,17 @@ def build_system_prompt(audience_instructions="", with_context_header=True):
 	return prompt + "Use the following context in your response:" if with_context_header else prompt
 
 
+# Publishers behind bot protection answer a crawl with a short "Access Denied"
+# page (~120 characters) and HTTP 200, which would otherwise be embedded as if
+# it were the source. Anything shorter than this is treated as a failed fetch.
+MIN_EXTRACTED_CHARS = 500
+
+
+def has_usable_content(docs, minimum=MIN_EXTRACTED_CHARS):
+	"""True when a loader returned real text rather than nothing or a block page."""
+	return bool(docs) and sum(len(d.page_content.strip()) for d in docs) >= minimum
+
+
 class HPVRAGPipeline:
 	"""One vector store + its source list (one per variant — see rag_sources.json).
 
@@ -206,8 +217,9 @@ class HPVRAGPipeline:
 			docs = loader.load()
 
 			print(f"Total characters: {len(docs[0].page_content)}")
-			if len(docs[0].page_content) == 0:
-				raise ValueError("Not a webpage")
+			if not has_usable_content(docs):
+				# Empty, or a bot-block notice — try the PDF loader below instead.
+				raise ValueError(f"Too little text ({len(docs[0].page_content)} chars); not a usable webpage")
 			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
 			return docs
 		except Exception as e:
@@ -233,6 +245,8 @@ class HPVRAGPipeline:
 				
 				print(f"Loaded {len(docs)} documents from {url}")
 				print(f"Total characters: {sum(len(doc.page_content) for doc in docs)}")
+				if not has_usable_content(docs):
+					raise ValueError("PDF produced too little text to index")
 				print(f"First few characters of the content: {docs[0].page_content[:100]}")
 				return docs
 			except Exception as e:

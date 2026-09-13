@@ -1,5 +1,5 @@
 {
-  "_about": "RAG sources per variant (keys must match variants.py). Each variant gets its own Chroma collection; 'sources' are web pages or PDF URLs crawled into it. Edited on the server: re-read by the nightly refresh (1 AM) or on restart. See README 'RAG sources'.",
+  "_about": "RAG sources per variant (keys must match variants.py). Each variant gets its own Chroma collection; 'sources' are web pages or PDF URLs crawled into it. 'note' is documentation only and is ignored by the loader. Edited on the server: re-read by the nightly refresh (1 AM) or on restart. See README 'RAG sources'.",
   "general": {
     "chroma": {
       "database": "Demo",
@@ -26,12 +26,27 @@
       { "url": "https://www.acog.org/womens-health/faqs/hpv-vaccination", "title": "ACOG — HPV Vaccination FAQ" },
       { "url": "https://www.who.int/news-room/fact-sheets/detail/human-papilloma-virus-and-cancer", "title": "WHO — HPV and cancer fact sheet" },
       { "url": "https://www.cdc.gov/hpv/hcp/vaccination-considerations/index.html", "title": "CDC — HPV vaccination considerations" },
-      { "url": "https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf" },
+      { "url": "https://www.cancer.org/content/dam/CRC/PDF/Public/7978.00.pdf", "title": "American Cancer Society — HPV (Human Papillomavirus) patient guide" },
       { "url": "https://www.cancer.org/content/dam/cancer-org/cancer-control/en/booklets-flyers/hpv-and-cancer-english.pdf", "title": "American Cancer Society — HPV and Cancer" },
       { "url": "https://www.plannedparenthood.org/learn/stds-hiv-safer-sex/hpv", "title": "Planned Parenthood — HPV" },
-      { "url": "https://pubmed.ncbi.nlm.nih.gov/39982254/" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/39982254/", "title": "Enduring Consensus Guidelines 2025 — Self-collected vaginal specimens for HPV testing (abstract)" },
       { "url": "https://asccp.org/wp-content/uploads/2025/11/ASCCP-Practice-Advisory-Self-Collection-for-Cervical-Cancer-Screening-final-updated-10-2-25.pdf", "title": "ASCCP — Self-collection for cervical cancer screening" },
-      { "url": "https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590" }
+      { "url": "https://www.tandfonline.com/doi/pdf/10.1080/21645515.2025.2539590", "title": "Real-world safety of HPV vaccines over 18 years: analysis of US VAERS reports (2025)" },
+      { "url": "https://www.acog.org/clinical/clinical-guidance/committee-opinion/articles/2020/08/human-papillomavirus-vaccination", "title": "ACOG Committee Opinion 809 — Human Papillomavirus Vaccination (2020)" },
+      { "url": "https://europepmc.org/articles/PMC6818701?pdf=render", "title": "MMWR 2019 — HPV Vaccination for Adults: Updated ACIP Recommendations (Meites et al.)", "note": "Europe PMC copy of cdc.gov/mmwr/volumes/68/wr/mm6832a3.htm — cdc.gov returns Access Denied to the crawler" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/32639044/", "title": "Saslow et al. 2020 — HPV vaccination 2020 guideline update: ACS guideline adaptation (abstract)", "note": "Abstract only: the full text (10.3322/caac.21616) is on Wiley, which blocks the crawler" },
+      { "url": "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC10825724/fullTextXML", "title": "Moss et al. 2024 — Immunogenicity of a 2-dose HPV vaccine series for post-partum women (JAMA Netw Open)", "note": "Europe PMC full text of jamanetwork.com/journals/jamanetworkopen/fullarticle/2814326 — jamanetwork.com blocks the crawler" },
+      { "url": "https://europepmc.org/articles/PMC11567082?pdf=render", "title": "Markowitz & Unger 2023 — Human Papillomavirus Vaccination (NEJM clinical practice)", "note": "Europe PMC copy of nejm.org/doi/full/10.1056/NEJMcp2108502 — nejm.org serves only a teaser to the crawler" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/31987733/", "title": "Yuan et al. 2020 — HPV infection and female infertility: systematic review and meta-analysis (abstract)", "note": "Abstract only: no open-access full text" },
+      { "url": "https://europepmc.org/articles/PMC7458962?pdf=render", "title": "Gazibara et al. 2020 — HPV vaccination and physical/mental health complaints, Denmark", "note": "Europe PMC open-access copy" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/29477308/", "title": "Arana et al. 2018 — Post-licensure safety monitoring of quadrivalent HPV vaccine in VAERS (abstract)", "note": "Abstract only: no open-access full text" },
+      { "url": "https://www.bmj.com/content/370/bmj.m2930", "title": "Hviid et al. 2020 — HPV vaccination and syndromes with autonomic dysfunction (BMJ)" },
+      { "url": "https://europepmc.org/articles/PMC12640735?pdf=render", "title": "Henschke et al. 2025 — Cochrane review: effects of HPV vaccination programmes and harms", "note": "Europe PMC open-access copy of Cochrane CD015363.pub2; this is a large document (~1000 chunks)" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/32253100/", "title": "Schmuhl et al. 2020 — No association between HPV vaccination and infertility, US females 18-33 (abstract)", "note": "Abstract only: Europe PMC has no full text for PMC7255493" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/31479634/", "title": "Christianson et al. 2020 — Primary ovarian insufficiency and HPV vaccines: review of evidence (abstract)", "note": "Abstract only: no open-access full text" },
+      { "url": "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC8391101/fullTextXML", "title": "Hviid & Myrup Thiesson 2021 — HPV vaccination and primary ovarian insufficiency, nationwide cohort (JAMA Netw Open)", "note": "Europe PMC full text — jamanetwork.com blocks the crawler" },
+      { "url": "https://pubmed.ncbi.nlm.nih.gov/28881394/", "title": "McInerney et al. 2017 — Effect of HPV vaccination on fecundability (abstract)", "note": "Abstract only: Europe PMC has no full text for PMC5690856" },
+      { "url": "https://europepmc.org/articles/PMC9866915?pdf=render", "title": "Torella et al. 2023 — Risk of premature ovarian insufficiency after HPV vaccination: PRISMA meta-analysis", "note": "Europe PMC open-access copy" }
     ]
   }
 }
