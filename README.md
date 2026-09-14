@@ -66,6 +66,28 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
   On Render the filesystem is ephemeral — edit the copy in the repo and redeploy.
 - A broken file or a failed rebuild is logged and the previous index keeps serving.
 - Adding a variant's first collection re-embeds every source once (OpenAI embedding cost).
+- `note` on a source is documentation only — the loader ignores it.
+
+### Picking URLs that the crawler can actually read
+
+Many publishers answer an automated fetch with HTTP 403 or a short "Access Denied" page
+(Wiley, JAMA, MDPI, cdc.gov, PMC, Springer and Elsevier all do; a newer User-Agent does
+not change it). A page that returns fewer than `MIN_EXTRACTED_CHARS` (500) characters is
+treated as a failed fetch rather than indexed, so a block page can never end up in the
+answers — check `sources.html` after a refresh to see what failed.
+
+Patterns that do work, in order of preference:
+
+| Source | URL to use |
+|---|---|
+| Open-access article in Europe PMC | `https://europepmc.org/articles/PMC<id>?pdf=render` |
+| Article whose PDF render 404s | `https://www.ebi.ac.uk/europepmc/webservices/rest/PMC<id>/fullTextXML` |
+| Paywalled article | `https://pubmed.ncbi.nlm.nih.gov/<pmid>/` — abstract only, but indexable |
+| Public guideline sites (acog.org, bmj.com, cancer.org PDFs) | their own URL |
+
+Find the open-access copy of a DOI with OpenAlex
+(`https://api.openalex.org/works/doi:<doi>`) or the Europe PMC search API, then confirm it
+before adding: point the crawl at the URL and check the character count.
 
 Providers see what is indexed at `sources.html` in the frontend, which reads
 `GET /api/rag/sources?variant=<key>` (dashboard token, same variant scoping as the

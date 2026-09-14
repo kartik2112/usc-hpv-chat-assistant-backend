@@ -15,6 +15,7 @@ import json
 import pytest
 
 import rag_sources
+from rag_pipeline import MIN_EXTRACTED_CHARS, has_usable_content
 from conftest import DASHBOARD_PW, auth_header as _auth, token_for as _token
 
 VALID = {
@@ -56,6 +57,24 @@ def test_shipped_file_is_valid_and_separates_collections():
     assert len(set(collections.values())) == len(collections)
     assert collections['general'] == 'hpv_facts_rag'   # unchanged: no re-embedding
     assert all(cfg.sources for cfg in config.values())
+    # The post-partum reading list is curated separately and is the longer one;
+    # general keeps its original nine sources.
+    assert len(config['general'].sources) == 9
+    assert len(config['postpartum'].sources) > len(config['general'].sources)
+    assert all(s.title for s in config['postpartum'].sources)
+
+
+class _Doc:
+    def __init__(self, text): self.page_content = text
+
+
+def test_block_pages_are_not_treated_as_content():
+    """Bot-protected publishers answer 200 with a short "Access Denied" page."""
+    assert not has_usable_content([_Doc('Access Denied Reference #18.921c1602 https://errors.edgesuite.net/')])
+    assert not has_usable_content([_Doc('Please enable JavaScript to proceed.')])
+    assert not has_usable_content([])
+    assert has_usable_content([_Doc('a' * MIN_EXTRACTED_CHARS)])
+    assert has_usable_content([_Doc('a' * 300), _Doc('b' * 300)])   # summed across pages
 
 
 @pytest.mark.parametrize('mutate, message', [

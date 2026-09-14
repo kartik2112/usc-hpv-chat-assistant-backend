@@ -39,6 +39,7 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 ## RAG sources
 - `rag_sources.json` (path overridable with `RAG_SOURCES_FILE`) maps each variant to a Chroma target (`database`, `collection`, optional `api_key_env`/`tenant_env` for another Chroma account) and its web page / PDF URLs.
 - Two variants sharing a collection is rejected at load: each build deletes chunks for URLs outside its own list.
+- Most publishers (Wiley, JAMA, MDPI, cdc.gov, PMC, Springer, Elsevier) block the crawler. Use `europepmc.org/articles/PMC<id>?pdf=render`, the Europe PMC `fullTextXML` REST endpoint, or a PubMed abstract URL instead, and verify the character count before adding. `has_usable_content()` / `MIN_EXTRACTED_CHARS` (500) in rag_pipeline.py stop a short block page being indexed as if it were the source.
 - `HPVRAGPipeline.describe_indexed_sources()` reads the collection's chunk metadata from Chroma (grouped by `source`) — that is what `/api/rag/sources` lists, so the viewer reflects Chroma, not the file. The file adds titles and the `not_indexed` / `not_in_config` flags; `index_report` (per URL: status/chunks/kind) and `built_at` describe the last crawl by this process.
 
 ## Storage layout
