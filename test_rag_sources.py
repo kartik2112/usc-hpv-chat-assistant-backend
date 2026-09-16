@@ -15,7 +15,7 @@ import json
 import pytest
 
 import rag_sources
-from rag_pipeline import MIN_EXTRACTED_CHARS, has_usable_content
+from rag_pipeline import MIN_EXTRACTED_CHARS, crawl_candidates, has_usable_content
 from conftest import DASHBOARD_PW, auth_header as _auth, token_for as _token
 
 VALID = {
@@ -75,6 +75,35 @@ def test_block_pages_are_not_treated_as_content():
     assert not has_usable_content([])
     assert has_usable_content([_Doc('a' * MIN_EXTRACTED_CHARS)])
     assert has_usable_content([_Doc('a' * 300), _Doc('b' * 300)])   # summed across pages
+
+
+def test_europepmc_article_links_try_the_rest_api_first():
+    """europepmc.org answers the crawler with a bot challenge (HTTP 403); the
+    same articles are served unchallenged as JATS XML by the REST API."""
+    rest = 'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC6818701/fullTextXML'
+    for url in ('https://europepmc.org/articles/PMC6818701?pdf=render',
+                'https://europepmc.org/articles/PMC6818701',
+                'https://www.europepmc.org/article/pmc/PMC6818701'):
+        # The configured URL stays as a fallback: only open-access articles have
+        # full text at the REST endpoint, which 404s for the rest.
+        assert crawl_candidates(url) == [rest, url]
+
+
+def test_other_sources_are_crawled_as_configured():
+    for url in ('https://pubmed.ncbi.nlm.nih.gov/29477308/',
+                'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC8391101/fullTextXML',
+                'https://www.cancer.org/some.pdf'):
+        assert crawl_candidates(url) == [url]
+
+
+def test_no_configured_source_is_a_known_blocked_publisher():
+    """Sources fronted by a bot challenge are configured as their open-access
+    equivalent instead (see the 'note' on each), so the nightly refresh can
+    actually fetch them."""
+    blocked = ('bmj.com', 'tandfonline.com', 'nejm.org', 'jamanetwork.com', 'wiley.com')
+    for key, variant in rag_sources.load_rag_sources().items():
+        for url in variant.urls:
+            assert not any(host in url for host in blocked), f'{key}: {url}'
 
 
 @pytest.mark.parametrize('mutate, message', [
