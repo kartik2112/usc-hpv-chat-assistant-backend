@@ -132,3 +132,42 @@ def test_dashboard_cannot_reach_other_variant_files(client):
                        json={'filenames': [fname, fname + 'x.json']})
     assert resp.status_code in (400, 404)
     assert os.path.exists(path)
+
+
+def test_event_offsets_survive_browser_timestamps(fb):
+    """Event offsets are computed against created_at, which must be UTC-aware.
+
+    index.html sends `new Date().toISOString()`, i.e. a 'Z'-suffixed string that
+    fromisoformat() parses as aware. When created_at was naive (datetime.utcnow())
+    the subtraction raised TypeError and every offset in the transcript fell back
+    to '?'. Both sides are aware now, so the offsets are real.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    created = datetime.now(timezone.utc) - timedelta(seconds=90)
+    session_id = 'tz-offsets'
+    fb.sessions[session_id] = {
+        'variant': 'general', 'created_at': created,
+        'last_activity': datetime.now(timezone.utc),
+        'messages': [], 'survey_responses': [], 'last_messages_seq': -1,
+        'events': [
+            {'type': 'user_message',
+             'timestamp': (created + timedelta(seconds=30)).replace(tzinfo=None).isoformat() + 'Z'},
+            {'type': 'bot_message',
+             'timestamp': (created + timedelta(seconds=75)).replace(tzinfo=None).isoformat() + 'Z'},
+        ],
+    }
+    fb.save_session_to_disk(session_id, fb.sessions[session_id],
+                            {'patient_questions': 'q', 'action_items': 'a'})
+
+    [txt] = glob.glob(os.path.join('sessions', 'general', f'*{session_id}*.txt'))
+    event_log = open(txt).read().split('EVENT LOG')[1]
+    assert '+30s' in event_log and '+1m15s' in event_log
+    assert '?' not in event_log
+
+    # Stored timestamps stay UTC, now carrying an explicit offset. to_pst()
+    # already accepted both forms, so the dashboard reads the same instant.
+    [js] = glob.glob(os.path.join('sessions', 'general', f'*{session_id}*.json'))
+    ended_at = json.load(open(js))['ended_at']
+    assert ended_at.endswith('+00:00')
+    assert fb.to_pst(ended_at) == fb.to_pst(ended_at.replace('+00:00', ''))

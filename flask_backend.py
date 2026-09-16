@@ -742,7 +742,7 @@ def _session_file_stem(variant, session_id):
 
     The variant tag in the name keeps a file self-describing even if it is
     copied out of its folder."""
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
     return os.path.join(variant.sessions_dir, f"session_{variant.key}_{session_id}_{timestamp}")
 
 
@@ -1024,7 +1024,7 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
     """Write session JSON and a human-readable TXT transcript to the variant's folder."""
     variant   = _variant_of(session_data)
     stem      = _session_file_stem(variant, session_id)
-    ended_at  = datetime.utcnow()
+    ended_at  = datetime.now(timezone.utc)
     created_at = session_data["created_at"]
 
     # Use the synced messages array; fall back to reconstructing from events if
@@ -1178,7 +1178,7 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
 
 def auto_expire_sessions():
     """APScheduler job: expire sessions inactive for > SESSION_TIMEOUT_MINUTES."""
-    cutoff = datetime.utcnow() - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=SESSION_TIMEOUT_MINUTES)
     with sessions_lock:
         expired_ids = [sid for sid, s in sessions.items() if s["last_activity"] < cutoff]
     for sid in expired_ids:
@@ -1572,7 +1572,7 @@ def session_start():
     # are persisted to disk and shown in the sessions dashboard.
     survey_responses = sanitize_survey_responses(data.get('survey_responses'))
     session_id = str(uuid.uuid4())
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     with sessions_lock:
         sessions[session_id] = {
             'variant': variant.key,
@@ -1596,7 +1596,7 @@ def session_activity():
     with sessions_lock:
         if session_id not in sessions:
             return jsonify({'error': 'session_expired'}), 404
-        sessions[session_id]['last_activity'] = datetime.utcnow()
+        sessions[session_id]['last_activity'] = datetime.now(timezone.utc)
     return jsonify({'status': 'ok'}), 200
 
 
@@ -1612,7 +1612,7 @@ def session_log():
     with sessions_lock:
         if session_id not in sessions:
             return jsonify({'error': 'session_expired'}), 404
-        sessions[session_id]['last_activity'] = datetime.utcnow()
+        sessions[session_id]['last_activity'] = datetime.now(timezone.utc)
         if event:
             sessions[session_id]['events'].append(event)
             # Re-sort after every insert so that fire-and-forget HTTP requests
@@ -1667,7 +1667,7 @@ def session_summary():
         # feedback questions and dismiss the summary before /api/session/end
         # runs, so without this touch auto_expire_sessions could reclaim the
         # session in between.
-        session_data['last_activity'] = datetime.utcnow()
+        session_data['last_activity'] = datetime.now(timezone.utc)
 
         if messages is not None:
             stored_seq = session_data.get('last_messages_seq', -1)
@@ -1698,7 +1698,7 @@ def session_summary():
         sd = sessions.get(session_id)
         if sd is not None:   # the session may have expired during the LLM call
             sd['summary_cache'] = {'fingerprint': fingerprint, 'summary': summary}
-            sd['last_activity'] = datetime.utcnow()
+            sd['last_activity'] = datetime.now(timezone.utc)
 
     return jsonify({'status': 'generated', 'summary': summary}), 200
 
@@ -2098,7 +2098,7 @@ def _build_merged_session(loaded, variant):
         'summary': summary,
         'favorite': favorite,
         'merged_from': [d.get('session_id') for _s, d in ordered],
-        'merged_at': datetime.utcnow().isoformat(),
+        'merged_at': datetime.now(timezone.utc).isoformat(),
     }
     return merged_id, payload
 
