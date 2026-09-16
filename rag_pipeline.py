@@ -5,8 +5,6 @@
 
 import os
 import re
-from functools import partial
-import shutil
 import tempfile
 from typing import Set
 import hashlib

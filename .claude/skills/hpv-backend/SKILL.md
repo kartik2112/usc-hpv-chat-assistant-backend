@@ -28,7 +28,7 @@ Deployed on Render (`gunicorn … --workers 1`) and `sackend.isi.edu`. Dependenc
 - `SESSIONS_PASSWORD_HASH`, `_make_dashboard_token()`, `_dashboard_token_scope()`, `require_dashboard_token` (injects `variant=`).
 - `generate_session_summary(messages, variant)`, `save_session_to_disk()`, `auto_expire_sessions()`.
 - `_rag_pipelines` — one pipeline per variant, built from `load_rag_sources()`; `daily_task()` re-reads the file and keeps the old pipeline for any variant that fails to rebuild.
-- Routes: `/api/chat` (SSE), `/api/audio-chat`, `/api/tts`, `/api/session/{start,activity,log,summary,end}`, `/api/sessions/auth`, `/api/sessions[/<file>]`, `/api/sessions/{favorite,delete,merge}`, `/api/rag/sources` (read-only sources viewer).
+- Routes: `/api/chat` (SSE), `/api/tts`, `/api/session/{start,activity,log,summary,end}`, `/api/sessions/auth`, `/api/sessions[/<file>]`, `/api/sessions/{favorite,delete,merge}`, `/api/rag/sources` (read-only sources viewer).
 
 ## Variants
 - Keys are `general` and `postpartum`, and they must match `variants.js` in the frontend repo.
