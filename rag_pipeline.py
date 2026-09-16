@@ -4,6 +4,7 @@
 # https://stackoverflow.com/questions/76870837/how-to-delete-documents-in-langchain-vectorstore
 
 import os
+import re
 from functools import partial
 import shutil
 import tempfile
@@ -64,6 +65,36 @@ MIN_EXTRACTED_CHARS = 500
 def has_usable_content(docs, minimum=MIN_EXTRACTED_CHARS):
 	"""True when a loader returned real text rather than nothing or a block page."""
 	return bool(docs) and sum(len(d.page_content.strip()) for d in docs) >= minimum
+
+
+# Sent by both loaders below. Some publishers reject the default
+# `python-requests/x.y` agent outright, so the PDF download has to identify
+# itself the same way the web crawl does.
+CRAWL_HEADERS = {
+	'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+	              '(KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
+}
+CRAWL_TIMEOUT = 60
+
+# europepmc.org sits behind a bot challenge that answers every crawl with HTTP
+# 403, but the same articles are served as plain JATS XML by the Europe PMC REST
+# API, which is meant to be read by machines and is not challenged. Rewrite
+# article links to that endpoint and try it first.
+_EUROPEPMC_ARTICLE = re.compile(r'^https?://(?:www\.)?europepmc\.org/(?:articles|article/pmc)/(PMC\d+)', re.I)
+EUROPEPMC_REST = 'https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML'
+
+
+def crawl_candidates(url):
+	"""The URLs to try for a source, best first.
+
+	Only articles Europe PMC holds under an open licence have full text at the
+	REST endpoint (it 404s for the rest), so the configured URL stays in the
+	list as a fallback.
+	"""
+	match = _EUROPEPMC_ARTICLE.match(url)
+	if match:
+		return [EUROPEPMC_REST.format(pmcid=match.group(1).upper()), url]
+	return [url]
 
 
 class HPVRAGPipeline:
@@ -201,6 +232,20 @@ class HPVRAGPipeline:
 					print(f"Removed URL {url} from Chroma Cloud.")
 
 	def _crawl_url(self, url):
+		"""Text for a source URL, or None if nothing usable could be fetched.
+
+		Each candidate (see crawl_candidates) is tried as a web page first and
+		then as a PDF, so a link that is really a PDF still gets indexed.
+		"""
+		for candidate in crawl_candidates(url):
+			if candidate != url:
+				print(f"Trying open-access endpoint {candidate} for {url}")
+			docs = self._load_as_webpage(candidate) or self._load_as_pdf(candidate)
+			if docs is not None:
+				return docs
+		return None
+
+	def _load_as_webpage(self, url):
 		try:
 			# Only keep post title, headers, and content from the full HTML.
 			# bs4_strainer = SoupStrainer(class_=("post-title", "post-header", "post-content"))
@@ -208,50 +253,46 @@ class HPVRAGPipeline:
 			loader = WebBaseLoader(
 				web_paths=(url, ),
 				bs_kwargs={"parse_only": bs4_strainer},
-				requests_kwargs={
-					'headers': {
-						'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.36'
-					}
-				}
+				requests_kwargs={'headers': CRAWL_HEADERS, 'timeout': CRAWL_TIMEOUT},
 			)
 			docs = loader.load()
 
 			print(f"Total characters: {len(docs[0].page_content)}")
 			if not has_usable_content(docs):
-				# Empty, or a bot-block notice — try the PDF loader below instead.
+				# Empty, or a bot-block notice — try the PDF loader instead.
 				raise ValueError(f"Too little text ({len(docs[0].page_content)} chars); not a usable webpage")
 			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
 			return docs
 		except Exception as e:
+			print(f"Could not read {url} as a webpage: {e}")
+			return None
+
+	def _load_as_pdf(self, url):
+		temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False)
+		temp_file_path = temp_file.name
+		try:
+			print(f"Trying to read {url} as a PDF")
 			try:
-				print(f"Trying to read {url} using OnlinePDFLoader")
-				# loader = OnlinePDFLoader(url)
-				temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', delete=False)
-				temp_file_path = temp_file.name
-				try:
-					with requests.get(url) as r:
-						r.raise_for_status()
-						temp_file.write(r.content)
-					print(f"Successfully downloaded file to: {temp_file_path}")
-					loader = PyPDFLoader(temp_file_path)
-					docs = loader.load()
-				except requests.exceptions.RequestException as e:
-					print(f"An error occurred during download: {e}")
-					if os.path.exists(temp_file_path):
-						os.remove(temp_file_path)
-					return None
-				finally:
-					temp_file.close()
-				
-				print(f"Loaded {len(docs)} documents from {url}")
-				print(f"Total characters: {sum(len(doc.page_content) for doc in docs)}")
-				if not has_usable_content(docs):
-					raise ValueError("PDF produced too little text to index")
-				print(f"First few characters of the content: {docs[0].page_content[:100]}")
-				return docs
-			except Exception as e:
-				print(f"Error loading PDF: {str(e)}")
-		return None
+				with requests.get(url, headers=CRAWL_HEADERS, timeout=CRAWL_TIMEOUT) as r:
+					r.raise_for_status()
+					temp_file.write(r.content)
+			finally:
+				temp_file.close()
+			print(f"Successfully downloaded file to: {temp_file_path}")
+			docs = PyPDFLoader(temp_file_path).load()
+
+			print(f"Loaded {len(docs)} documents from {url}")
+			print(f"Total characters: {sum(len(doc.page_content) for doc in docs)}")
+			if not has_usable_content(docs):
+				raise ValueError("PDF produced too little text to index")
+			print(f"First few characters of the content: {docs[0].page_content[:100]}")
+			return docs
+		except Exception as e:
+			print(f"Error loading PDF from {url}: {e}")
+			return None
+		finally:
+			if os.path.exists(temp_file_path):
+				os.remove(temp_file_path)
 
 	def _record(self, url, status, chunks, kind=None):
 		"""Note what this build did with a URL, for the sources viewer.
