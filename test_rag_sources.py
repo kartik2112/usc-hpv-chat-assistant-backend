@@ -15,7 +15,8 @@ import json
 import pytest
 
 import rag_sources
-from rag_pipeline import MIN_EXTRACTED_CHARS, crawl_candidates, has_usable_content
+from rag_pipeline import (CHROMA_MAX_BATCH, MIN_EXTRACTED_CHARS, crawl_candidates,
+                          has_usable_content, in_batches)
 from conftest import DASHBOARD_PW, auth_header as _auth, token_for as _token
 
 VALID = {
@@ -94,6 +95,15 @@ def test_other_sources_are_crawled_as_configured():
                 'https://www.ebi.ac.uk/europepmc/webservices/rest/PMC8391101/fullTextXML',
                 'https://www.cancer.org/some.pdf'):
         assert crawl_candidates(url) == [url]
+
+
+def test_chroma_writes_stay_under_the_cloud_record_limit():
+    # Chroma Cloud refuses a single write of more than 300 records.
+    assert CHROMA_MAX_BATCH <= 300
+    batches = list(in_batches(list(range(396))))
+    assert all(len(b) <= CHROMA_MAX_BATCH for b in batches)
+    assert [x for b in batches for x in b] == list(range(396))
+    assert list(in_batches([])) == []
 
 
 def test_no_configured_source_is_a_known_blocked_publisher():
