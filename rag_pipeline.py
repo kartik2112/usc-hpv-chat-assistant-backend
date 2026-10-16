@@ -74,6 +74,16 @@ CRAWL_HEADERS = {
 }
 CRAWL_TIMEOUT = 60
 
+# Chroma Cloud rejects any single write that carries more than 300 records
+# ("Quota exceeded: 'Number of records' ... for action 'Upsert'"), and a long
+# PDF easily splits into more chunks than that. Writes go in batches below it.
+CHROMA_MAX_BATCH = 250
+
+
+def in_batches(items, size=CHROMA_MAX_BATCH):
+	for i in range(0, len(items), size):
+		yield items[i:i + size]
+
 # europepmc.org sits behind a bot challenge that answers every crawl with HTTP
 # 403, but the same articles are served as plain JATS XML by the Europe PMC REST
 # API, which is meant to be read by machines and is not challenged. Rewrite
@@ -225,7 +235,7 @@ class HPVRAGPipeline:
 		if USE_CHROMA_CLOUD:
 			for url in self.existing_urls_to_chroma_ids.keys():
 				if url not in self.urls:
-					self.vector_store.delete(ids=self.existing_urls_to_chroma_ids[url])
+					self._delete_ids(self.existing_urls_to_chroma_ids[url])
 					self.removed_urls.append(url)
 					print(f"Removed URL {url} from Chroma Cloud.")
 
@@ -318,8 +328,6 @@ class HPVRAGPipeline:
 			self._record(url, "unchanged", len(previous_ids), kind)
 			return
 		else:
-			if USE_CHROMA_CLOUD and len(previous_ids) > 0:
-				self.vector_store.delete(ids=previous_ids)
 			print(f"Adding new content from URL {url}")
 			# if not(USE_CHROMA_CLOUD):
 			# 	print(docs)
@@ -331,9 +339,26 @@ class HPVRAGPipeline:
 
 			print(f"Split blog post into {len(all_splits)} sub-documents.")
 
-			document_ids = self.vector_store.add_documents(documents=all_splits)
-			print(document_ids)
+			# Add the new chunks before deleting the old ones, so a failed write
+			# leaves the previous build's content in place instead of nothing.
+			document_ids = []
+			try:
+				for batch in in_batches(all_splits):
+					document_ids.extend(self.vector_store.add_documents(documents=batch))
+			except Exception as e:
+				print(f"Error storing chunks for {url}: {e}")
+				if document_ids:
+					self._delete_ids(document_ids)
+				self._record(url, "failed", len(previous_ids), kind)
+				return
+			print(f"Stored {len(document_ids)} chunks for {url}")
+			if USE_CHROMA_CLOUD and len(previous_ids) > 0:
+				self._delete_ids(previous_ids)
 			self._record(url, "updated" if previous_ids else "added", len(document_ids), kind)
+
+	def _delete_ids(self, ids):
+		for batch in in_batches(list(ids)):
+			self.vector_store.delete(ids=batch)
 
 	# def _crawl_webpage_and_add_to_rag(self, url):
 	# 	try:
