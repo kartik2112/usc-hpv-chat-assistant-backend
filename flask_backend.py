@@ -862,7 +862,7 @@ def generate_session_summary(messages, variant=DEFAULT_VARIANT):
                     "raised by the patient. (ONLY CAPTURE QUESTIONS ASKED BY THE USER IN THE JSON. DO NO HALLUCINATE. DO NOT ADD ANY ADDITIONAL QUESTIONS)\n"
                     "2. 'action_items': A bullet-point list of follow-up action items for the "
                     "healthcare provider to initiate the conversation in that direction. "
-                    "These should only be with respect to questions that indicate misconceptions about "
+                    "Prioritize questions that indicate misconceptions about "
                     "HPV the patient demonstrated with their questions. "
                     "Do not capture all possible actions that a provider should do. Focus on the few most important ones based on the conversation. "
                     "Please refrain from converting every question into an action item. Keep this extremely brief, concise and to the point.\n"
