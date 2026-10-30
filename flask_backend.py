@@ -713,6 +713,12 @@ def _variant_of(session_data):
     return VARIANTS.get(session_data.get('variant'), DEFAULT_VARIANT)
 
 
+def _language_of(session_data):
+    """Most recent UI language ("en"/"es") recorded on the session's events."""
+    return next((e.get('language') for e in reversed(session_data.get('events', []))
+                 if e.get('language')), 'en')
+
+
 def _request_variant(data):
     """Variant for a patient-facing request.
 
@@ -825,7 +831,7 @@ def _messages_fingerprint(messages):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def generate_session_summary(messages, variant=DEFAULT_VARIANT):
+def generate_session_summary(messages, variant=DEFAULT_VARIANT, language="en"):
     """Call the LLM to produce a patient-questions + doctor-action-items summary.
 
     PHI-flagged messages are stripped before sending to the LLM as a
@@ -838,10 +844,10 @@ def generate_session_summary(messages, variant=DEFAULT_VARIANT):
         if not messages:
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
 
-        # Remove any message whose content contains PHI so it is never sent to the LLM.
+        # Remove any user message whose content contains PHI so it is never sent to the LLM.
         clean_messages = [
             m for m in messages
-            if not detect_phi_backend(m.get("content", ""))
+            if m.get("role") != "user" or not detect_phi_backend(m.get("content", ""), language)
         ]
 
         if not clean_messages:
@@ -1033,10 +1039,11 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
                 f"({len(raw_messages)} entries)"
             )
 
-    # Strip PHI-flagged messages before writing to disk (defence-in-depth).
+    # Strip PHI-flagged user messages before writing to disk (defence-in-depth).
+    language = _language_of(session_data)
     clean_messages = [
         m for m in raw_messages
-        if not detect_phi_backend(m.get("content", ""))
+        if m.get("role") != "user" or not detect_phi_backend(m.get("content", ""), language)
     ]
 
     # Feedback comes from the event stream, but those events are fire-and-forget
@@ -1191,7 +1198,8 @@ def auto_expire_sessions():
                 summary = cached['summary']
                 logger.info(f"Session {sid}: reusing cached summary on expiry.")
             else:
-                summary = generate_session_summary(messages, _variant_of(session_data))
+                summary = generate_session_summary(messages, _variant_of(session_data),
+                                                   _language_of(session_data))
             save_session_to_disk(sid, session_data, summary)
             logger.info(f"Auto-expired session {sid}")
 
@@ -1569,11 +1577,12 @@ def session_summary():
         if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
             return jsonify({'status': 'cached', 'summary': cached['summary']}), 200
         variant = _variant_of(session_data)
+        language = _language_of(session_data)
 
     # The LLM call happens OUTSIDE sessions_lock deliberately. Holding a global
     # lock across a multi-second completion would stall every other session's
     # /log, /activity and /chat.
-    summary = generate_session_summary(effective_messages, variant)
+    summary = generate_session_summary(effective_messages, variant, language)
 
     with sessions_lock:
         sd = sessions.get(session_id)
@@ -1632,7 +1641,8 @@ def session_end():
         summary = cached['summary']
         logger.info(f"Session {session_id}: reusing cached summary.")
     else:
-        summary = generate_session_summary(effective_messages, _variant_of(session_data))
+        summary = generate_session_summary(effective_messages, _variant_of(session_data),
+                                           _language_of(session_data))
 
     filename = save_session_to_disk(session_id, session_data, summary,
                                     feedback_override=feedback_payload)
