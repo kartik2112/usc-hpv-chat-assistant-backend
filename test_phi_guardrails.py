@@ -328,6 +328,16 @@ def test_language_of_reads_session_events():
     assert fb._language_of({"events": []}) == "en"
 
 
+def test_merged_summary_uses_session_language(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fb, "generate_session_summary",
+                        lambda messages, variant, language="en": seen.append(language) or {})
+    sessions = [("a", _session_data(SPANISH_SESSION, "es")),
+                ("b", _session_data(SPANISH_SESSION, "es"))]
+    fb._build_merged_session(sessions, fb.DEFAULT_VARIANT)
+    assert seen == ["es"]
+
+
 @pytest.mark.parametrize("turns,lang", [(SPANISH_SESSION, "es"), (ENGLISH_SESSION, "en")])
 def test_summary_receives_every_turn(captured_llm_input, turns, lang):
     summary = fb.generate_session_summary(_messages(turns), language=lang)

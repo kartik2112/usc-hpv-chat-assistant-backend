@@ -1969,7 +1969,8 @@ def _build_merged_session(loaded, variant):
     audio_model = ', '.join(audio_models) if audio_models else AUDIO_MODEL_LABEL
 
     # Regenerate a single coherent summary from the merged conversation.
-    summary = generate_session_summary(merged_messages, variant)
+    summary = generate_session_summary(merged_messages, variant,
+                                       _language_of({'events': merged_events}))
 
     created_at = min((d.get('created_at') or '' for _s, d in ordered), default='')
     ended_at = max((d.get('ended_at') or '' for _s, d in ordered), default='')

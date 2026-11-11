@@ -74,7 +74,7 @@ def fb(tmp_path_factory):
     rag_pipeline.build_rag_pipeline = FakePipeline   # no crawling / Chroma
     sys.modules.pop('flask_backend', None)
     module = importlib.import_module('flask_backend')
-    module.generate_session_summary = lambda messages, variant=None: {
+    module.generate_session_summary = lambda messages, variant=None, language='en': {
         'patient_questions': f'• asked ({variant.key})', 'action_items': ''}
     yield module
     module.scheduler.shutdown(wait=False)
