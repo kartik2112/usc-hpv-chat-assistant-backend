@@ -252,3 +252,116 @@ def test_true_positive(sentence, lang):
     assert detections != [], (
         f"Expected PHI detection but got none for:\n  '{sentence}'"
     )
+
+
+# ===========================================================================
+# SESSION SUMMARY / SAVE — PHI filtering uses the session's language
+# ===========================================================================
+
+SPANISH_SESSION = [
+    ("user", "¿Qué es el VPH?"),
+    ("assistant", "El VPH (Virus del Papiloma Humano) es un grupo de virus relacionados, algunos de los cuales pueden causar verrugas o provocar ciertos cánceres."),
+    ("user", "¿Cuáles son los síntomas de la infección por VPH?"),
+    ("assistant", "La infección por VPH a menudo no tiene signos o síntomas. Las personas con infección por VPH generalmente no saben que la tienen. Algunos tipos de VPH pueden causar verrugas genitales. Cuando las infecciones por VPH persisten, pueden convertirse en cáncer."),
+    ("user", "¿Qué tan común es el VPH?"),
+    ("assistant", "La infección por VPH es la infección de transmisión sexual más común en los Estados Unidos. La mayoría de las personas que tienen relaciones sexuales contraerán una infección por VPH en algún momento de sus vidas."),
+    ("user", "¿Cómo se transmite de una persona a otra?"),
+    ("assistant", "Hay alrededor de 40 tipos de VPH que típicamente infectan los genitales. Se transmite a través del contacto piel con piel durante las relaciones sexuales vaginales, anales u orales. Puede contraer una infección por VPH incluso sin tener relaciones sexuales."),
+    ("user", "¿Se pueden tratar las infecciones por VPH?"),
+    ("assistant", "Las infecciones por VPH generalmente son lentas. En la mayoría de las personas, el sistema inmunológico elimina el VPH del cuerpo antes de que cause enfermedad. Las verrugas se pueden extirpar con medicamentos o cirugía."),
+]
+
+ENGLISH_SESSION = [
+    ("user", "What is HPV?"),
+    ("assistant", "HPV (Human Papillomavirus) is a group of related viruses, some of which can cause warts or lead to certain cancers."),
+    ("user", "What are symptoms of HPV infection?"),
+    ("assistant", "HPV infection often has no signs or symptoms. People with HPV infection usually do not know they have it. This is one reason why HPV spreads easily. Some types of HPV can cause genital warts, which are growths on the outside or inside of the vagina or penis. When HPV infections last longer, they can turn into cancer."),
+    ("user", "How is it passed from one person to another?"),
+    ("assistant", "There are about 40 types of HPV that typically infect the genitals. It is spread by skin-to-skin contact during vaginal, anal, or oral sex. You can get a HPV infection even if you do not have sexual intercourse."),
+]
+
+
+def _messages(turns):
+    return [{"role": role, "content": content} for role, content in turns]
+
+
+def _session_data(turns, lang):
+    from datetime import datetime, timezone
+    return {
+        "variant": "general",
+        "created_at": datetime.now(timezone.utc),
+        "events": [
+            {"seq": i, "type": "User Text Query" if role == "user" else "Assistant Text Response",
+             "timestamp": datetime.now(timezone.utc).isoformat(), "language": lang, "details": content}
+            for i, (role, content) in enumerate(turns, start=1)
+        ],
+        "messages": _messages(turns),
+    }
+
+
+@pytest.fixture
+def captured_llm_input(monkeypatch):
+    """Stub the OpenAI call and record the conversation text sent to it."""
+    from types import SimpleNamespace
+    sent = []
+
+    def fake_create(**kwargs):
+        sent.append(kwargs["messages"][-1]["content"])
+        content = '{"patient_questions": "• q", "action_items": "• a"}'
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    monkeypatch.setattr(fb.client.chat.completions, "create", fake_create)
+    return sent
+
+
+@pytest.fixture
+def saved_payload(monkeypatch, tmp_path):
+    """Redirect save_session_to_disk into tmp_path and return a loader for the JSON."""
+    import json
+    monkeypatch.setattr(fb, "_session_file_stem", lambda variant, sid: str(tmp_path / sid))
+    return lambda sid: json.load(open(tmp_path / f"{sid}.json"))
+
+
+def test_language_of_reads_session_events():
+    assert fb._language_of(_session_data(SPANISH_SESSION, "es")) == "es"
+    assert fb._language_of(_session_data(ENGLISH_SESSION, "en")) == "en"
+    assert fb._language_of({"events": []}) == "en"
+
+
+def test_merged_summary_uses_session_language(monkeypatch):
+    seen = []
+    monkeypatch.setattr(fb, "generate_session_summary",
+                        lambda messages, variant, language="en": seen.append(language) or {})
+    sessions = [("a", _session_data(SPANISH_SESSION, "es")),
+                ("b", _session_data(SPANISH_SESSION, "es"))]
+    fb._build_merged_session(sessions, fb.DEFAULT_VARIANT)
+    assert seen == ["es"]
+
+
+@pytest.mark.parametrize("turns,lang", [(SPANISH_SESSION, "es"), (ENGLISH_SESSION, "en")])
+def test_summary_receives_every_turn(captured_llm_input, turns, lang):
+    summary = fb.generate_session_summary(_messages(turns), language=lang)
+    assert summary["action_items"] == "• a"
+    for _role, content in turns:
+        assert content in captured_llm_input[0]
+
+
+@pytest.mark.parametrize("turns,lang", [(SPANISH_SESSION, "es"), (ENGLISH_SESSION, "en")])
+def test_saved_transcript_keeps_every_turn(saved_payload, turns, lang):
+    fb.save_session_to_disk(f"test-{lang}", _session_data(turns, lang), summary={})
+    assert saved_payload(f"test-{lang}")["messages"] == _messages(turns)
+
+
+def test_summary_still_drops_user_phi(captured_llm_input):
+    phi_question = "Mi nombre es Juan García"
+    turns = SPANISH_SESSION[:2] + [("user", phi_question)]
+    fb.generate_session_summary(_messages(turns), language="es")
+    assert phi_question not in captured_llm_input[0]
+    assert SPANISH_SESSION[0][1] in captured_llm_input[0]
+
+
+def test_saved_transcript_still_drops_user_phi(saved_payload):
+    phi_question = "Mi nombre es Juan García"
+    turns = SPANISH_SESSION[:2] + [("user", phi_question)]
+    fb.save_session_to_disk("test-phi", _session_data(turns, "es"), summary={})
+    assert saved_payload("test-phi")["messages"] == _messages(SPANISH_SESSION[:2])

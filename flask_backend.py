@@ -713,6 +713,12 @@ def _variant_of(session_data):
     return VARIANTS.get(session_data.get('variant'), DEFAULT_VARIANT)
 
 
+def _language_of(session_data):
+    """Most recent UI language ("en"/"es") recorded on the session's events."""
+    return next((e.get('language') for e in reversed(session_data.get('events', []))
+                 if e.get('language')), 'en')
+
+
 def _request_variant(data):
     """Variant for a patient-facing request.
 
@@ -825,7 +831,7 @@ def _messages_fingerprint(messages):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def generate_session_summary(messages, variant=DEFAULT_VARIANT):
+def generate_session_summary(messages, variant=DEFAULT_VARIANT, language="en"):
     """Call the LLM to produce a patient-questions + doctor-action-items summary.
 
     PHI-flagged messages are stripped before sending to the LLM as a
@@ -838,10 +844,10 @@ def generate_session_summary(messages, variant=DEFAULT_VARIANT):
         if not messages:
             return {"patient_questions": "No conversation recorded.", "action_items": ""}
 
-        # Remove any message whose content contains PHI so it is never sent to the LLM.
+        # Remove any user message whose content contains PHI so it is never sent to the LLM.
         clean_messages = [
             m for m in messages
-            if not detect_phi_backend(m.get("content", ""))
+            if m.get("role") != "user" or not detect_phi_backend(m.get("content", ""), language)
         ]
 
         if not clean_messages:
@@ -859,13 +865,18 @@ def generate_session_summary(messages, variant=DEFAULT_VARIANT):
                     "Given a patient–assistant "
                     "conversation about HPV, produce a concise JSON summary with exactly two fields:\n"
                     "1. 'patient_questions': A bullet-point list of the main questions and concerns "
-                    "raised by the patient. (ONLY CAPTURE QUESTIONS ASKED BY THE USER IN THE JSON. DO NO HALLUCINATE. DO NOT ADD ANY ADDITIONAL QUESTIONS)\n"
+                    "raised by the patient. (ONLY CAPTURE WHAT THE USER ACTUALLY SAID. DO NO HALLUCINATE. DO NOT ADD ANY ADDITIONAL QUESTIONS) "
+                    "If the patient asked no HPV questions (e.g. only a greeting or small talk), "
+                    "briefly describe what they said instead, e.g. \"• Greeted the assistant; no HPV questions asked\".\n"
                     "2. 'action_items': A bullet-point list of follow-up action items for the "
                     "healthcare provider to initiate the conversation in that direction. "
-                    "These should only be with respect to questions that indicate misconceptions about "
+                    "Prioritize questions that indicate misconceptions about "
                     "HPV the patient demonstrated with their questions. "
+                    "If there are no misconceptions, give 1-2 items based on the patient's main concerns; "
+                    "if the patient raised no HPV topics, suggest the provider ask whether they have questions about HPV or the HPV vaccine. "
                     "Do not capture all possible actions that a provider should do. Focus on the few most important ones based on the conversation. "
                     "Please refrain from converting every question into an action item. Keep this extremely brief, concise and to the point.\n"
+                    "NEVER LEAVE EITHER FIELD EMPTY.\n"
                     "ALWAYS TRANSLATE THE SUMMARY TO ENGLISH, regardless of the language of the conversation.\n"
                     "Return ONLY valid JSON. Example:\n"
                     '{"patient_questions": "• Question 1\\n• Question 2", '
@@ -1033,10 +1044,11 @@ def save_session_to_disk(session_id, session_data, summary, feedback_override=No
                 f"({len(raw_messages)} entries)"
             )
 
-    # Strip PHI-flagged messages before writing to disk (defence-in-depth).
+    # Strip PHI-flagged user messages before writing to disk (defence-in-depth).
+    language = _language_of(session_data)
     clean_messages = [
         m for m in raw_messages
-        if not detect_phi_backend(m.get("content", ""))
+        if m.get("role") != "user" or not detect_phi_backend(m.get("content", ""), language)
     ]
 
     # Feedback comes from the event stream, but those events are fire-and-forget
@@ -1191,7 +1203,8 @@ def auto_expire_sessions():
                 summary = cached['summary']
                 logger.info(f"Session {sid}: reusing cached summary on expiry.")
             else:
-                summary = generate_session_summary(messages, _variant_of(session_data))
+                summary = generate_session_summary(messages, _variant_of(session_data),
+                                                   _language_of(session_data))
             save_session_to_disk(sid, session_data, summary)
             logger.info(f"Auto-expired session {sid}")
 
@@ -1569,11 +1582,12 @@ def session_summary():
         if cached and fingerprint is not None and cached.get('fingerprint') == fingerprint:
             return jsonify({'status': 'cached', 'summary': cached['summary']}), 200
         variant = _variant_of(session_data)
+        language = _language_of(session_data)
 
     # The LLM call happens OUTSIDE sessions_lock deliberately. Holding a global
     # lock across a multi-second completion would stall every other session's
     # /log, /activity and /chat.
-    summary = generate_session_summary(effective_messages, variant)
+    summary = generate_session_summary(effective_messages, variant, language)
 
     with sessions_lock:
         sd = sessions.get(session_id)
@@ -1632,7 +1646,8 @@ def session_end():
         summary = cached['summary']
         logger.info(f"Session {session_id}: reusing cached summary.")
     else:
-        summary = generate_session_summary(effective_messages, _variant_of(session_data))
+        summary = generate_session_summary(effective_messages, _variant_of(session_data),
+                                           _language_of(session_data))
 
     filename = save_session_to_disk(session_id, session_data, summary,
                                     feedback_override=feedback_payload)
@@ -1959,7 +1974,8 @@ def _build_merged_session(loaded, variant):
     audio_model = ', '.join(audio_models) if audio_models else AUDIO_MODEL_LABEL
 
     # Regenerate a single coherent summary from the merged conversation.
-    summary = generate_session_summary(merged_messages, variant)
+    summary = generate_session_summary(merged_messages, variant,
+                                       _language_of({'events': merged_events}))
 
     created_at = min((d.get('created_at') or '' for _s, d in ordered), default='')
     ended_at = max((d.get('ended_at') or '' for _s, d in ordered), default='')
