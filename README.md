@@ -45,7 +45,7 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
 
 ```json
 "postpartum": {
-  "chroma":  { "database": "Demo", "collection": "hpv_postpartum_rag" },
+  "chroma":  { "database": "Demo", "collection": "hpv_postpartum_rag_3small" },
   "sources": [
     { "url": "https://example.org/handout.pdf", "title": "Optional label" },
     "https://example.org/a-page"
@@ -66,6 +66,19 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
   On Render the filesystem is ephemeral — edit the copy in the repo and redeploy.
 - A broken file or a failed rebuild is logged and the previous index keeps serving.
 - Adding a variant's first collection re-embeds every source once (OpenAI embedding cost).
+- **Rebuilds only embed what changed.** Each source's text is hashed; if Chroma already
+  holds exactly one copy of that hash, embedded by the current `EMBEDDING_MODEL`
+  (`text-embedding-3-small`, in `rag_pipeline.py`), the source is skipped with no OpenAI
+  call. Reads from Chroma are paged (`read_all`), because Chroma Cloud returns at most
+  300 records per read — an unpaged read made most sources look missing, and they were
+  re-embedded on every start and refresh.
+- Changing `EMBEDDING_MODEL` re-embeds everything; point the variants at **new**
+  collection names when you do, so the old index keeps serving until the new one is built.
+- `content_selector` (optional, CSS) limits a web page to the element holding the article,
+  e.g. `"content_selector": "main"`. Only that element is indexed and hashed. Lines such as
+  "Last reviewed: …" are dropped from every web page before hashing, so a re-dated page is
+  not re-embedded. If the selector stops matching, the crawl fails and the previous chunks
+  keep serving — check `sources.html`.
 - `note` on a source is documentation only — the loader ignores it.
 
 ### Picking URLs that the crawler can actually read

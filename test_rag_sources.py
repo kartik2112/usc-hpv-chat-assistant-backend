@@ -56,7 +56,8 @@ def test_shipped_file_is_valid_and_separates_collections():
     config = rag_sources.load_rag_sources()      # the repo's rag_sources.json
     collections = {key: cfg.chroma.collection for key, cfg in config.items()}
     assert len(set(collections.values())) == len(collections)
-    assert collections['general'] == 'hpv_facts_rag'   # unchanged: no re-embedding
+    # Collections are named for the embedding model they hold (see EMBEDDING_MODEL).
+    assert all(name.endswith('_3small') for name in collections.values())
     assert all(cfg.sources for cfg in config.values())
     # The post-partum reading list is curated separately and is the longer one;
     # general keeps its original nine sources.
