@@ -87,18 +87,11 @@ def in_batches(items, size=CHROMA_MAX_BATCH):
 		yield items[i:i + size]
 
 
-# Chroma Cloud also returns at most 300 records per read, and silently stops
-# there. Any read that may cover more than that has to page (see read_all).
+# Chroma Cloud also caps reads at 300 records, silently.
 CHROMA_MAX_READ = 250
 
 
 def read_all(vector_store, **get_kwargs):
-	"""vector_store.get(...) over every matching record, one page at a time.
-
-	Returns {"ids": [...], "metadatas": [...]}. A single unpaged get() would
-	stop at Chroma Cloud's read limit and make the rest of the collection look
-	missing, which is what caused sources to be re-embedded on every build.
-	"""
 	ids, metadatas, offset = [], [], 0
 	while True:
 		page = vector_store.get(include=["metadatas"], limit=CHROMA_MAX_READ, offset=offset, **get_kwargs)
@@ -109,23 +102,17 @@ def read_all(vector_store, **get_kwargs):
 		offset += CHROMA_MAX_READ
 
 
-# Every chunk records the model that embedded it. Query vectors must come from
-# the same model, and ada-002 and text-embedding-3-small are both 1536-wide, so
-# a mix would not error, it would just retrieve the wrong chunks. A chunk
-# embedded by another model counts as stale and is re-embedded.
+# Recorded on each chunk; chunks from another model are re-embedded. Changing it
+# needs new collections (ada and 3-small are both 1536-d, so mixing fails silently).
 EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 def chunk_ids(url, fulltext_hash, count):
-	"""Deterministic ids for a source's chunks. Writes are upserts, so two
-	servers indexing the same content at once overwrite each other instead of
-	leaving duplicate chunks."""
+	# Deterministic, so concurrent builds upsert instead of duplicating.
 	return [hashlib.sha256(f"{url}|{fulltext_hash}|{EMBEDDING_MODEL}|{i}".encode()).hexdigest()[:40]
 			for i in range(count)]
 
 
-# Text loaded as a "web page" that is really something else (a PDF served to the
-# HTML loader decodes as megabytes of control characters) must not be indexed.
 def looks_like_binary(text, sample=20000, max_ratio=0.02):
 	if not text:
 		return False
@@ -134,25 +121,19 @@ def looks_like_binary(text, sample=20000, max_ratio=0.02):
 	return odd / len(head) > max_ratio
 
 
-# Lines that change without the content changing ("Last reviewed: May 3, 2026").
-# They are dropped before hashing and indexing, so a re-dated page is not
-# re-embedded, and patients aren't answered with a review date.
+# Dropped before hashing so a re-dated page isn't re-embedded.
 VOLATILE_LINE = re.compile(
 	r"^\s*(last\s+(reviewed|updated|modified|revised)|page\s+last\s+(reviewed|updated)|"
 	r"(content\s+)?(updated|reviewed|accessed)(\s+on\b|\s*:)|date\s+accessed\b).*$",
 	re.IGNORECASE | re.MULTILINE)
 
-# Europe PMC fullTextXML is JATS XML; its <p> and heading text reads fine through
-# the HTML parser, which is what the crawl has always used for it.
+# Europe PMC fullTextXML parses fine as HTML.
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 WEB_TEXT_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']
 
 
 def extract_page_text(html, content_selector=""):
-	"""The readable text of a page: paragraphs, headings and list items, from
-	the element matching `content_selector` (CSS) if given, else the whole page.
-	Raises ValueError if the selector matches nothing (layout changed)."""
 	if content_selector:
 		root = BeautifulSoup(html, "html.parser").select_one(content_selector)
 		if root is None:
@@ -162,7 +143,6 @@ def extract_page_text(html, content_selector=""):
 		elements = BeautifulSoup(html, "html.parser", parse_only=SoupStrainer(WEB_TEXT_TAGS)).find_all(WEB_TEXT_TAGS)
 	lines, seen_nested = [], set()
 	for el in elements:
-		# An <li> holding a <p> would otherwise contribute its text twice.
 		if any(id(parent) in seen_nested for parent in el.parents):
 			continue
 		seen_nested.add(id(el))
@@ -257,9 +237,6 @@ class HPVRAGPipeline:
 		# encode_kwargs = {"normalize_embeddings": True}
 
 	def _setup_rag_agent(self):
-		"""Index every configured source, then drop chunks of sources no longer
-		configured. Unchanged sources cost one small Chroma read and no
-		embedding calls, so this is cheap to run on every start and refresh."""
 		for url in self.urls:
 			self._alt_crawl_webpage_and_add_to_rag(url=url)
 		self.clean_up_extra_urls()
@@ -273,7 +250,6 @@ class HPVRAGPipeline:
 		file was edited since the last refresh, or a crawl failed.
 
 		Returns {url: {"chunks": int, "kind": "pdf"|"web", "fulltext_hash": str}}.
-		Pages through the whole collection (read-only, no embeddings).
 		"""
 		indexed = {}
 		for metadata in read_all(self.vector_store)["metadatas"]:
@@ -290,16 +266,10 @@ class HPVRAGPipeline:
 	def get_string_hash(self, docs):
 		return hashlib.sha256("\n".join([doc.page_content for doc in docs]).encode('utf-8')).hexdigest()
 
-	def stored_chunks(self, url):
-		"""(ids, {(fulltext_hash, embedding_model)}) of the chunks Chroma holds
-		for one source. Chunks written before the model was recorded have
-		embedding_model None, so they never match and get replaced."""
-		found = read_all(self.vector_store, where={"source": url})
-		versions = {(m.get("fulltext_hash"), m.get("embedding_model")) for m in found["metadatas"]}
-		return found["ids"], versions
+	def stored_chunk_ids(self, url):
+		return read_all(self.vector_store, where={"source": url})["ids"]
 
 	def clean_up_extra_urls(self):
-		"""Delete chunks whose source is no longer in this variant's list."""
 		stale = defaultdict(list)
 		everything = read_all(self.vector_store)
 		for chunk_id, metadata in zip(everything["ids"], everything["metadatas"]):
@@ -311,12 +281,7 @@ class HPVRAGPipeline:
 			print(f"Removed {len(ids)} chunks of {url} (no longer configured).")
 
 	def _crawl_url(self, url):
-		"""Text for a source URL, or None if nothing usable could be fetched.
-
-		Each candidate (see crawl_candidates) is tried as a web page first and
-		then as a PDF, so a link that is really a PDF still gets indexed. A
-		.pdf link goes to the PDF loader first.
-		"""
+		"""Text for a source URL, or None. Tries web page then PDF (reversed for .pdf links)."""
 		selector = self.content_selectors.get(url, "")
 		for candidate in crawl_candidates(url):
 			if candidate != url:
@@ -393,42 +358,39 @@ class HPVRAGPipeline:
 	def _alt_crawl_webpage_and_add_to_rag(self, url):
 		print(f"Crawling webpage: {url}")
 		docs = self._crawl_url(url)
-		# Looked up per source (paged), so the answer is complete however
-		# large the collection gets.
-		previous_ids, stored_versions = self.stored_chunks(url)
+		previous_ids = self.stored_chunk_ids(url)
 
 		if docs is None:
 			self._record(url, "failed", len(previous_ids))
 			return
 		kind = "pdf" if "page" in (docs[0].metadata or {}) else "web"   # PyPDFLoader adds 'page'
 		fulltext_hash = self.get_string_hash(docs)
+		all_splits = self.text_splitter.split_documents(docs)
+		new_ids = chunk_ids(url, fulltext_hash, len(all_splits))
 
-		# Exactly one copy of this content, embedded by this model: nothing to do.
-		# Anything else (new, edited, duplicated, or embedded by another model)
-		# is rewritten once.
-		if stored_versions == {(fulltext_hash, EMBEDDING_MODEL)}:
+		# Ids encode url, hash and model, so a match means this content is already indexed.
+		if set(new_ids) <= set(previous_ids):
+			self._delete_ids(sorted(set(previous_ids) - set(new_ids)))
 			print(f"URL {url} with hash {fulltext_hash} already indexed.")
-			self._record(url, "unchanged", len(previous_ids), kind)
+			self._record(url, "unchanged", len(new_ids), kind)
 			return
 
 		print(f"Adding new content from URL {url}")
-		all_splits = self.text_splitter.split_documents(docs)
 		for split in all_splits:
 			split.metadata['fulltext_hash'] = fulltext_hash
 			split.metadata['source'] = url
 			split.metadata['embedding_model'] = EMBEDDING_MODEL
-		new_ids = chunk_ids(url, fulltext_hash, len(all_splits))
 		print(f"Split {url} into {len(all_splits)} chunks.")
 
-		# Add the new chunks before deleting the old ones, so a failed write
-		# leaves the previous build's content in place instead of nothing.
+		# Write before deleting, so a failed write keeps the previous content.
 		written = []
 		try:
 			for docs_batch, ids_batch in zip(in_batches(all_splits), in_batches(new_ids)):
 				written.extend(self.vector_store.add_documents(documents=docs_batch, ids=ids_batch))
 		except Exception as e:
 			print(f"Error storing chunks for {url}: {e}")
-			self._delete_ids([i for i in written if i not in set(previous_ids)])
+			keep = set(previous_ids)
+			self._delete_ids([i for i in written if i not in keep])
 			self._record(url, "failed", len(previous_ids), kind)
 			return
 		print(f"Stored {len(written)} chunks for {url}")

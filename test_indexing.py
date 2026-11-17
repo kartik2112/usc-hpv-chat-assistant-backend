@@ -1,12 +1,4 @@
-"""
-test_indexing.py
-================
-How a RAG build decides what to embed. Embedding is the OpenAI cost, so a
-rebuild must embed only sources whose text changed. Runs offline against a
-fake vector store that, like Chroma Cloud, returns at most 300 records per read.
-
-    uv run pytest test_indexing.py -v
-"""
+"""What a RAG build embeds. Offline: uv run pytest test_indexing.py -v"""
 
 from collections import defaultdict
 
@@ -21,11 +13,11 @@ CLOUD_READ_LIMIT = 300
 
 
 class FakeCloudStore:
-    """Enough of langchain_chroma.Chroma for indexing, with Chroma Cloud's read cap."""
+    """Chroma stand-in with Chroma Cloud's 300-record read cap."""
 
     def __init__(self):
-        self.records = {}            # id -> metadata (insertion-ordered)
-        self.embedded = 0            # chunks sent to the embedding model
+        self.records = {}            # id -> metadata
+        self.embedded = 0            # chunks embedded
 
     def get(self, include=None, limit=None, offset=None, where=None):
         rows = [(i, m) for i, m in self.records.items()
@@ -48,7 +40,6 @@ class FakeCloudStore:
 
 
 def make_pipeline(store, pages):
-    """A pipeline over `pages` ({url: text}) without touching OpenAI, Chroma or the network."""
     sources = RagSources(chroma=ChromaTarget(database="d", collection="c"),
                          sources=tuple(Source(url=u) for u in pages))
     p = rp.HPVRAGPipeline.__new__(rp.HPVRAGPipeline)
@@ -74,7 +65,7 @@ def chunks_per_source(store):
     return dict(counts)
 
 
-# Big enough that the collection is far past the 300-record read limit.
+# Well past the 300-record read cap.
 PAGES = {f"https://example.org/{n}": " ".join(f"word{n}-{i}" for i in range(12000)) for n in range(4)}
 
 
@@ -84,9 +75,9 @@ def test_unchanged_rebuild_embeds_nothing_even_past_the_read_limit():
     first = store.embedded
     assert len(store.records) > CLOUD_READ_LIMIT
     p = build(store, PAGES)
-    assert store.embedded == first                      # no OpenAI calls the second time
+    assert store.embedded == first
     assert all(r["status"] == "unchanged" for r in p.index_report.values())
-    assert len(store.records) == first                  # and no duplicates
+    assert len(store.records) == first
 
 
 def test_only_the_edited_source_is_re_embedded_and_old_chunks_go():
@@ -104,8 +95,6 @@ def test_only_the_edited_source_is_re_embedded_and_old_chunks_go():
 
 
 def test_duplicates_and_other_model_chunks_are_replaced_once():
-    """A collection bloated by the old bug (several copies, ada-era chunks with
-    no embedding_model) is rewritten to one clean copy, then left alone."""
     store = FakeCloudStore()
     url = "https://example.org/0"
     for copy in range(3):
@@ -142,6 +131,26 @@ def test_chunks_record_the_embedding_model():
     assert rp.EMBEDDING_MODEL == "text-embedding-3-small"
 
 
+def test_extra_copies_are_deleted_without_re_embedding():
+    store = FakeCloudStore()
+    pages = {"https://example.org/0": "text " * 2000}
+    build(store, pages)
+    clean, embedded = dict(store.records), store.embedded
+    store.records["dup"] = {"source": "https://example.org/0", "fulltext_hash": "old"}
+    build(store, pages)
+    assert store.records == clean and store.embedded == embedded
+
+
+def test_partially_written_source_is_completed():
+    store = FakeCloudStore()
+    pages = {"https://example.org/0": "text " * 2000}
+    build(store, pages)
+    store.records.pop(next(iter(store.records)))
+    p = build(store, pages)
+    assert p.index_report["https://example.org/0"]["status"] == "updated"
+    assert len(store.records) == p.index_report["https://example.org/0"]["chunks"]
+
+
 # ── Text extraction ───────────────────────────────────────────────────────────
 
 def test_pdf_bytes_read_as_a_web_page_are_rejected():
@@ -158,7 +167,7 @@ def test_content_selector_keeps_only_the_article():
       <footer><p>Page last updated: May 3, 2026</p></footer></body></html>"""
     assert rp.extract_page_text(html, "main") == "HPV vaccine\nTwo doses are recommended.\nNested item"
     whole = rp.extract_page_text(html)
-    assert "Home" in whole and "last updated" not in whole       # date line dropped anyway
+    assert "Home" in whole and "last updated" not in whole
     with pytest.raises(ValueError):
         rp.extract_page_text(html, "article.missing")
 
@@ -178,7 +187,7 @@ def test_ordinary_sentences_are_kept():
     assert rp.strip_volatile_lines(text) == text
 
 
-def test_pdf_links_try_the_pdf_loader_first(monkeypatch):
+def test_pdf_links_try_the_pdf_loader_first():
     p = make_pipeline(FakeCloudStore(), {})
     del p._crawl_url
     calls = []
