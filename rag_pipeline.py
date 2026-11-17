@@ -6,16 +6,18 @@
 import os
 import re
 import tempfile
-from typing import Set
 import hashlib
 from datetime import datetime, timezone
 
+import warnings
+
 import requests
-from bs4 import SoupStrainer
+from bs4 import BeautifulSoup, SoupStrainer, XMLParsedAsHTMLWarning
 
 from chromadb.config import Settings
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain.agents.middleware import dynamic_prompt, ModelRequest
@@ -84,6 +86,76 @@ def in_batches(items, size=CHROMA_MAX_BATCH):
 	for i in range(0, len(items), size):
 		yield items[i:i + size]
 
+
+# Chroma Cloud also caps reads at 300 records, silently.
+CHROMA_MAX_READ = 250
+
+
+def read_all(vector_store, **get_kwargs):
+	ids, metadatas, offset = [], [], 0
+	while True:
+		page = vector_store.get(include=["metadatas"], limit=CHROMA_MAX_READ, offset=offset, **get_kwargs)
+		ids += page.get("ids") or []
+		metadatas += [m or {} for m in (page.get("metadatas") or [])]
+		if len(page.get("ids") or []) < CHROMA_MAX_READ:
+			return {"ids": ids, "metadatas": metadatas}
+		offset += CHROMA_MAX_READ
+
+
+# Recorded on each chunk; chunks from another model are re-embedded. Changing it
+# needs new collections (ada and 3-small are both 1536-d, so mixing fails silently).
+EMBEDDING_MODEL = "text-embedding-3-small"
+
+
+def chunk_ids(url, fulltext_hash, count):
+	# Deterministic, so concurrent builds upsert instead of duplicating.
+	return [hashlib.sha256(f"{url}|{fulltext_hash}|{EMBEDDING_MODEL}|{i}".encode()).hexdigest()[:40]
+			for i in range(count)]
+
+
+def looks_like_binary(text, sample=20000, max_ratio=0.02):
+	if not text:
+		return False
+	head = text[:sample]
+	odd = sum(1 for ch in head if (ord(ch) < 32 and ch not in "\n\r\t") or ch == "�")
+	return odd / len(head) > max_ratio
+
+
+# Dropped before hashing so a re-dated page isn't re-embedded.
+VOLATILE_LINE = re.compile(
+	r"^\s*(last\s+(reviewed|updated|modified|revised)|page\s+last\s+(reviewed|updated)|"
+	r"(content\s+)?(updated|reviewed|accessed)(\s+on\b|\s*:)|date\s+accessed\b).*$",
+	re.IGNORECASE | re.MULTILINE)
+
+# Europe PMC fullTextXML parses fine as HTML.
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+
+WEB_TEXT_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li']
+
+
+def extract_page_text(html, content_selector=""):
+	if content_selector:
+		root = BeautifulSoup(html, "html.parser").select_one(content_selector)
+		if root is None:
+			raise ValueError(f"content_selector {content_selector!r} matched nothing")
+		elements = root.find_all(WEB_TEXT_TAGS)
+	else:
+		elements = BeautifulSoup(html, "html.parser", parse_only=SoupStrainer(WEB_TEXT_TAGS)).find_all(WEB_TEXT_TAGS)
+	lines, seen_nested = [], set()
+	for el in elements:
+		if any(id(parent) in seen_nested for parent in el.parents):
+			continue
+		seen_nested.add(id(el))
+		text = el.get_text(" ", strip=True)
+		if text:
+			lines.append(text)
+	return strip_volatile_lines("\n".join(lines))
+
+
+def strip_volatile_lines(text):
+	text = VOLATILE_LINE.sub("", text)
+	return "\n".join(line for line in text.splitlines() if line.strip())
+
 # europepmc.org sits behind a bot challenge that answers every crawl with HTTP
 # 403, but the same articles are served as plain JATS XML by the Europe PMC REST
 # API, which is meant to be read by machines and is not challenged. Rewrite
@@ -119,7 +191,7 @@ class HPVRAGPipeline:
 
 		self.openai_text_model = openai_text_model
 
-		self.embeddings = OpenAIEmbeddings()
+		self.embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL)
 		self.response_llm = ChatOpenAI(
 			model_name=openai_text_model,
 			max_completion_tokens=max_completion_tokens,
@@ -145,15 +217,8 @@ class HPVRAGPipeline:
 				client_settings=chroma_setting,
 			)
 
-		# Initialize text splitter
-		self.text_splitter = RecursiveCharacterTextSplitter(
-			chunk_size=1000,
-			chunk_overlap=200
-		)
-
-		self.existing_urls = set()
-		self.existing_urls_to_chroma_ids = defaultdict(list)
 		self.urls = rag_sources.urls
+		self.content_selectors = {s.url: s.content_selector for s in rag_sources.sources}
 		self.index_report = {}      # url -> {status, chunks, kind}; see _record()
 		self.removed_urls = []      # URLs dropped from the collection by this build
 
@@ -172,24 +237,10 @@ class HPVRAGPipeline:
 		# encode_kwargs = {"normalize_embeddings": True}
 
 	def _setup_rag_agent(self):
-		"""Set up the RAG database"""
-		# for url in self.urls:
-		# 	self._crawl_webpage_and_add_to_rag(url=url)
-		if USE_CHROMA_CLOUD:
-			self.fetch_current_chromadb_entries()
 		for url in self.urls:
 			self._alt_crawl_webpage_and_add_to_rag(url=url)
-		if USE_CHROMA_CLOUD:
-			self.clean_up_extra_urls()
+		self.clean_up_extra_urls()
 		self.built_at = datetime.now(timezone.utc).isoformat()
-
-		# Create QA chain
-		# self.qa_chain = ConversationalRetrievalChain.from_llm(
-		# 	llm=self.response_llm,
-		# 	retriever=self.vector_store.as_retriever(search_type="similarity",
-		# 												search_kwargs={"k": 5}),
-		# 	return_source_documents=True
-		# )
 
 	def describe_indexed_sources(self):
 		"""What this collection actually holds in Chroma right now.
@@ -199,13 +250,9 @@ class HPVRAGPipeline:
 		file was edited since the last refresh, or a crawl failed.
 
 		Returns {url: {"chunks": int, "kind": "pdf"|"web", "fulltext_hash": str}}.
-		Note this pulls the metadata of every chunk in the collection (a few
-		hundred here); it is a read-only call and makes no embeddings.
 		"""
-		entries = self.vector_store.get(include=["metadatas"])
 		indexed = {}
-		for metadata in entries.get("metadatas") or []:
-			metadata = metadata or {}
+		for metadata in read_all(self.vector_store)["metadatas"]:
 			url = metadata.get("source")
 			if not url:
 				continue
@@ -219,57 +266,54 @@ class HPVRAGPipeline:
 	def get_string_hash(self, docs):
 		return hashlib.sha256("\n".join([doc.page_content for doc in docs]).encode('utf-8')).hexdigest()
 
-	def fetch_current_chromadb_entries(self):
-		entities = self.vector_store.get(include=["metadatas"])
-		print(f"Entities: {len(entities['metadatas'])}")
-		if len(entities['metadatas']) > 0:
-			for id, metadata in zip(entities["ids"], entities["metadatas"]):
-				self.existing_urls.add((metadata["source"], metadata["fulltext_hash"]))
-				self.existing_urls_to_chroma_ids[metadata["source"]].append(id)
-		if len(self.existing_urls) > 0:
-			print(f"Found existing URLs in Chroma Cloud:")
-			print(self.existing_urls)
+	def stored_chunk_ids(self, url):
+		return read_all(self.vector_store, where={"source": url})["ids"]
 
 	def clean_up_extra_urls(self):
-		"""Remove URLs from Chroma DB that are no longer present in the existing URLs set."""
-		if USE_CHROMA_CLOUD:
-			for url in self.existing_urls_to_chroma_ids.keys():
-				if url not in self.urls:
-					self._delete_ids(self.existing_urls_to_chroma_ids[url])
-					self.removed_urls.append(url)
-					print(f"Removed URL {url} from Chroma Cloud.")
+		stale = defaultdict(list)
+		everything = read_all(self.vector_store)
+		for chunk_id, metadata in zip(everything["ids"], everything["metadatas"]):
+			if metadata.get("source") not in self.urls:
+				stale[metadata.get("source")].append(chunk_id)
+		for url, ids in stale.items():
+			self._delete_ids(ids)
+			self.removed_urls.append(url)
+			print(f"Removed {len(ids)} chunks of {url} (no longer configured).")
 
 	def _crawl_url(self, url):
-		"""Text for a source URL, or None if nothing usable could be fetched.
-
-		Each candidate (see crawl_candidates) is tried as a web page first and
-		then as a PDF, so a link that is really a PDF still gets indexed.
-		"""
+		"""Text for a source URL, or None. Tries web page then PDF (reversed for .pdf links)."""
+		selector = self.content_selectors.get(url, "")
 		for candidate in crawl_candidates(url):
 			if candidate != url:
 				print(f"Trying open-access endpoint {candidate} for {url}")
-			docs = self._load_as_webpage(candidate) or self._load_as_pdf(candidate)
+			if candidate.lower().split("?")[0].endswith(".pdf"):
+				docs = self._load_as_pdf(candidate) or self._load_as_webpage(candidate, selector)
+			else:
+				docs = self._load_as_webpage(candidate, selector) or self._load_as_pdf(candidate)
 			if docs is not None:
 				return docs
 		return None
 
-	def _load_as_webpage(self, url):
+	def _load_as_webpage(self, url, content_selector=""):
 		try:
-			# Only keep post title, headers, and content from the full HTML.
-			# bs4_strainer = SoupStrainer(class_=("post-title", "post-header", "post-content"))
-			bs4_strainer = SoupStrainer(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li'])
-			loader = WebBaseLoader(
-				web_paths=(url, ),
-				bs_kwargs={"parse_only": bs4_strainer},
-				requests_kwargs={'headers': CRAWL_HEADERS, 'timeout': CRAWL_TIMEOUT},
-			)
-			docs = loader.load()
+			with requests.get(url, headers=CRAWL_HEADERS, timeout=CRAWL_TIMEOUT) as r:
+				r.raise_for_status()
+				content_type = r.headers.get("Content-Type", "").lower()
+				if "pdf" in content_type or r.content[:5] == b"%PDF-":
+					raise ValueError(f"served as a PDF ({content_type or 'no content type'})")
+				if r.encoding is None or r.encoding.lower() == "iso-8859-1":
+					r.encoding = r.apparent_encoding   # what WebBaseLoader did
+				html = r.text
+			if looks_like_binary(html):
+				raise ValueError("response is binary, not a web page")
+			text = extract_page_text(html, content_selector)
+			docs = [Document(page_content=text, metadata={"source": url})]
 
-			print(f"Total characters: {len(docs[0].page_content)}")
+			print(f"Total characters: {len(text)}")
 			if not has_usable_content(docs):
 				# Empty, or a bot-block notice — try the PDF loader instead.
-				raise ValueError(f"Too little text ({len(docs[0].page_content)} chars); not a usable webpage")
-			print(f"First few characters of the content: {docs[0].page_content[:200].replace("\n", " ")}")
+				raise ValueError(f"Too little text ({len(text)} chars); not a usable webpage")
+			print(f"First few characters of the content: {text[:200].replace(chr(10), ' ')}")
 			return docs
 		except Exception as e:
 			print(f"Could not read {url} as a webpage: {e}")
@@ -314,47 +358,45 @@ class HPVRAGPipeline:
 	def _alt_crawl_webpage_and_add_to_rag(self, url):
 		print(f"Crawling webpage: {url}")
 		docs = self._crawl_url(url)
-		previous_ids = self.existing_urls_to_chroma_ids[url]
+		previous_ids = self.stored_chunk_ids(url)
 
 		if docs is None:
 			self._record(url, "failed", len(previous_ids))
 			return
 		kind = "pdf" if "page" in (docs[0].metadata or {}) else "web"   # PyPDFLoader adds 'page'
-		all_splits = self.text_splitter.split_documents(docs)
 		fulltext_hash = self.get_string_hash(docs)
+		all_splits = self.text_splitter.split_documents(docs)
+		new_ids = chunk_ids(url, fulltext_hash, len(all_splits))
 
-		if (url, fulltext_hash) in self.existing_urls:
-			print(f"URL {url} with hash {fulltext_hash} already exists.")
-			self._record(url, "unchanged", len(previous_ids), kind)
+		# Ids encode url, hash and model, so a match means this content is already indexed.
+		if set(new_ids) <= set(previous_ids):
+			self._delete_ids(sorted(set(previous_ids) - set(new_ids)))
+			print(f"URL {url} with hash {fulltext_hash} already indexed.")
+			self._record(url, "unchanged", len(new_ids), kind)
 			return
-		else:
-			print(f"Adding new content from URL {url}")
-			# if not(USE_CHROMA_CLOUD):
-			# 	print(docs)
-			# Compute hashes for all splits
-			for split in all_splits:
-				split.metadata['fulltext_hash'] = fulltext_hash
-				split.metadata['source'] = url
-				
 
-			print(f"Split blog post into {len(all_splits)} sub-documents.")
+		print(f"Adding new content from URL {url}")
+		for split in all_splits:
+			split.metadata['fulltext_hash'] = fulltext_hash
+			split.metadata['source'] = url
+			split.metadata['embedding_model'] = EMBEDDING_MODEL
+		print(f"Split {url} into {len(all_splits)} chunks.")
 
-			# Add the new chunks before deleting the old ones, so a failed write
-			# leaves the previous build's content in place instead of nothing.
-			document_ids = []
-			try:
-				for batch in in_batches(all_splits):
-					document_ids.extend(self.vector_store.add_documents(documents=batch))
-			except Exception as e:
-				print(f"Error storing chunks for {url}: {e}")
-				if document_ids:
-					self._delete_ids(document_ids)
-				self._record(url, "failed", len(previous_ids), kind)
-				return
-			print(f"Stored {len(document_ids)} chunks for {url}")
-			if USE_CHROMA_CLOUD and len(previous_ids) > 0:
-				self._delete_ids(previous_ids)
-			self._record(url, "updated" if previous_ids else "added", len(document_ids), kind)
+		# Write before deleting, so a failed write keeps the previous content.
+		written = []
+		try:
+			for docs_batch, ids_batch in zip(in_batches(all_splits), in_batches(new_ids)):
+				written.extend(self.vector_store.add_documents(documents=docs_batch, ids=ids_batch))
+		except Exception as e:
+			print(f"Error storing chunks for {url}: {e}")
+			keep = set(previous_ids)
+			self._delete_ids([i for i in written if i not in keep])
+			self._record(url, "failed", len(previous_ids), kind)
+			return
+		print(f"Stored {len(written)} chunks for {url}")
+		keep = set(new_ids)
+		self._delete_ids([i for i in previous_ids if i not in keep])
+		self._record(url, "updated" if previous_ids else "added", len(new_ids), kind)
 
 	def _delete_ids(self, ids):
 		for batch in in_batches(list(ids)):

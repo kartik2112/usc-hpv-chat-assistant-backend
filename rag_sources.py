@@ -10,7 +10,8 @@
 #       "chroma":  {"database": "...", "collection": "...",
 #                   "api_key_env": "CHROMA_API_KEY",  # optional: env var names,
 #                   "tenant_env":  "CHROMA_TENANT"},  # to use another Chroma account
-#       "sources": [{"url": "https://...", "title": "optional"}, ...]
+#       "sources": [{"url": "https://...", "title": "optional",
+#                    "content_selector": "optional CSS selector, e.g. main article"}, ...]
 #     },
 #     "_anything": "keys starting with _ are ignored (comments)"
 #   }
@@ -42,6 +43,10 @@ class ChromaTarget:
 class Source:
     url: str
     title: str = ''
+    # CSS selector for the element holding the article on a web page. Only that
+    # element is indexed (and hashed), so menus, footers and "last updated"
+    # banners around it neither pollute retrieval nor trigger re-embedding.
+    content_selector: str = ''
 
 
 @dataclass(frozen=True)
@@ -71,7 +76,8 @@ def _parse_variant(key, raw):
         if url in seen:
             raise ValueError(f"'{key}.sources': duplicate URL {url}")
         seen.add(url)
-        sources.append(Source(url=url, title=str(item.get('title', '')).strip()))
+        sources.append(Source(url=url, title=str(item.get('title', '')).strip(),
+                              content_selector=str(item.get('content_selector', '')).strip()))
     return RagSources(chroma=target, sources=tuple(sources))
 
 

@@ -3,7 +3,7 @@
   "general": {
     "chroma": {
       "database": "Demo",
-      "collection": "hpv_facts_rag"
+      "collection": "hpv_facts_rag_3small"
     },
     "sources": [
       { "url": "https://www.acog.org/womens-health/faqs/hpv-vaccination", "title": "ACOG — HPV Vaccination FAQ" },
@@ -20,7 +20,7 @@
   "postpartum": {
     "chroma": {
       "database": "Demo",
-      "collection": "hpv_postpartum_rag"
+      "collection": "hpv_postpartum_rag_3small"
     },
     "sources": [
       { "url": "https://www.acog.org/womens-health/faqs/hpv-vaccination", "title": "ACOG — HPV Vaccination FAQ" },

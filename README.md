@@ -45,7 +45,7 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
 
 ```json
 "postpartum": {
-  "chroma":  { "database": "Demo", "collection": "hpv_postpartum_rag" },
+  "chroma":  { "database": "Demo", "collection": "hpv_postpartum_rag_3small" },
   "sources": [
     { "url": "https://example.org/handout.pdf", "title": "Optional label" },
     "https://example.org/a-page"
@@ -66,6 +66,11 @@ Each variant answers from **its own** vector store, listed in `rag_sources.json`
   On Render the filesystem is ephemeral — edit the copy in the repo and redeploy.
 - A broken file or a failed rebuild is logged and the previous index keeps serving.
 - Adding a variant's first collection re-embeds every source once (OpenAI embedding cost).
+- Rebuilds embed only sources whose text changed (hash per source, paged Chroma reads —
+  Chroma Cloud caps reads at 300 records). Changing `EMBEDDING_MODEL` (`rag_pipeline.py`)
+  re-embeds everything, so use new collection names when you do.
+- Optional `content_selector` (CSS, e.g. `"main"`) indexes only that element of a page.
+  "Last reviewed/updated …" lines are ignored, so a re-dated page isn't re-embedded.
 - `note` on a source is documentation only — the loader ignores it.
 
 ### Picking URLs that the crawler can actually read
